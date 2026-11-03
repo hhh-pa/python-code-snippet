@@ -1,18 +1,32 @@
 #!/usr/bin/env python3
 """Load-independent Callgrind performance measurement for Python snippets.
 
-Runs every src/**/*.py script against the shared test cases and records
-metrics under Valgrind Callgrind:
+Each case runs twice per repeat: once natively under GNU time (stdout
+gate plus wall/cpu/RSS) and once under Valgrind Callgrind (instruction
+count), mirroring the clojure twin's lean recipe:
 
-  * instructions (simulated instruction reads 'Ir' from Callgrind) --
+  * callgrind_instructions (simulated instruction reads 'Ir') --
     fully load-independent and deterministic across runs.
-  * cpu_s (user + sys CPU time).
-  * wall_s (wall time).
-  * maxrss_kb (peak RSS in KB).
+  * cpu_s (user + sys CPU time from GNU time).
+  * wall_s (wall time from GNU time).
+  * maxrss_kb (peak RSS in KB from GNU time).
+
+Comparison rule (hhh-pa/clojure-code-snippet issue #40): the Bencher
+value for Ir is the SUM of per-case MINIMUMS (least-disturbed run) on
+CPython exactly as on JVM and clojure-rs, so BMF values compare
+directly across runtimes. cpu_time sums per-case medians and
+peak_memory takes the max per-case median (bytes) on both sides.
+Benchmark names stay stable across the rule change.
+
+GNU time is required (Debian/Ubuntu: apt install time); without it
+measure.py fails fast rather than reporting maxrss=0 / wall-clock
+cpu approximations. Valgrind remains optional: without it the timed
+signals still record but callgrind_instructions stays null.
 
 Usage:
     python3 tools/measure.py --resources tests/resources \
-        [--repeat 1] [--jobs 2] [--timeout 300] [--only substring] \
+        [--repeat 1] [--callgrind-repeat 1] [--jobs 2] [--timeout 300] \
+        [--only substring] [--time-bin BIN] \
         [--output perf.json] [--bmf-output bencher.json] \
         [--summary-file "$GITHUB_STEP_SUMMARY"] [--shard K/N]
 
@@ -34,14 +48,19 @@ import subprocess
 import sys
 import tempfile
 import time
+
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "tests"))
 import run_tests
 
-TOOL_VERSION = 1
+TOOL_VERSION = 2
 _CALLGRIND_TOTAL_RE = re.compile(r"^(?:totals|summary):\s*(\d+)", re.MULTILINE)
+
+# GNU time -f layout; byte-identical to the clojure twin's TimeFormat
+# so wall/cpu/RSS fields reconcile field-for-field.
+TIME_FORMAT = "wall=%e user=%U sys=%S maxrss_kb=%M cpu_pct=%P major_faults=%F minor_faults=%R"
 
 
 def parse_callgrind_output(content):
@@ -60,6 +79,75 @@ def parse_callgrind_output(content):
                 except (ValueError, IndexError):
                     pass
     return None
+
+
+def parse_time_text(text):
+    """Parse one GNU time -f TIME_FORMAT line into a metrics dict.
+
+    Mirrors the clojure twin's ParseTimeText: cpu_s is user+sys, and
+    any missing/unparseable field is an error, never a silent zero.
+    """
+    fields = {}
+    for token in text.split():
+        if "=" in token:
+            key, _, value = token.partition("=")
+            fields[key] = value
+    try:
+        wall = float(fields["wall"])
+        user = float(fields["user"])
+        sys_s = float(fields["sys"])
+        maxrss_kb = int(fields["maxrss_kb"])
+        cpu_pct = float(fields["cpu_pct"].rstrip("%"))
+        major = int(fields["major_faults"])
+        minor = int(fields["minor_faults"])
+    except (KeyError, ValueError) as exc:
+        raise ValueError("unparseable GNU time output: {!r}".format(text.strip())) from exc
+    return {
+        "wall_s": wall,
+        "user_s": user,
+        "sys_s": sys_s,
+        "cpu_s": user + sys_s,
+        "maxrss_kb": maxrss_kb,
+        "cpu_pct": cpu_pct,
+        "major_faults": major,
+        "minor_faults": minor,
+    }
+
+
+def resolve_time_bin(explicit=""):
+    """Locate a GNU time binary, mirroring the clojure ResolveTimeBin.
+
+    Raises RuntimeError when none is found (or the candidate is not
+    GNU time): the memory signal must be real, never a fallback zero.
+    """
+    path = explicit
+    if not path:
+        if os.path.exists("/usr/bin/time"):
+            path = "/usr/bin/time"
+        else:
+            found = shutil.which("time")
+            if found:
+                path = found
+    if not path:
+        raise RuntimeError(
+            "GNU time not found: install it (Debian/Ubuntu: apt install time) or pass --time-bin"
+        )
+    try:
+        proc = subprocess.run(
+            [path, "--version"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=10,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise RuntimeError("cannot execute time binary {!r}: {}".format(path, exc)) from exc
+    if b"GNU" not in proc.stdout:
+        raise RuntimeError(
+            "{!r} is not GNU time (need -f/-o support); install GNU time or pass --time-bin".format(
+                path
+            )
+        )
+    return path
 
 
 def parse_shard(text):
@@ -99,83 +187,145 @@ def summarize_numbers(values):
     }
 
 
-def measure_case_callgrind(has_valgrind, script, case_name, input_path, output_path, repeat, timeout):
+def timed_run_once(time_bin, script, input_path, timeout):
+    """One native run under GNU time; returns (stdout, metrics, error)."""
+    with open(input_path, "rb") as stdin_fd:
+        time_fd, time_file = tempfile.mkstemp(prefix="snip-time-")
+        os.close(time_fd)
+        try:
+            cmd = [time_bin, "-f", TIME_FORMAT, "-o", time_file, sys.executable, script]
+            try:
+                proc = subprocess.run(
+                    cmd,
+                    stdin=stdin_fd,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    timeout=timeout,
+                )
+            except subprocess.TimeoutExpired:
+                return None, None, "TIMEOUT (>{}s)".format(timeout)
+            if proc.returncode != 0:
+                err_text = proc.stderr.decode(errors="ignore").strip().splitlines()
+                tail = err_text[-1] if err_text else "no stderr"
+                return None, None, "exit {}: {}".format(proc.returncode, tail)
+            with open(time_file, "r", errors="ignore") as fd:
+                raw = fd.read()
+        finally:
+            try:
+                os.unlink(time_file)
+            except OSError:
+                pass
+    try:
+        metrics = parse_time_text(raw)
+    except ValueError as exc:
+        return None, None, "time output unreadable: {}".format(exc)
+    return proc.stdout, metrics, None
+
+
+def callgrind_run_once(script, input_path, timeout):
+    """One Valgrind Callgrind run; returns (stdout, ir, error)."""
+    fd_temp, callgrind_file = tempfile.mkstemp(prefix="snip-cg-", suffix=".out")
+    os.close(fd_temp)
+    try:
+        cmd = [
+            "valgrind",
+            "--tool=callgrind",
+            "--callgrind-out-file={}".format(callgrind_file),
+            sys.executable,
+            script,
+        ]
+        with open(input_path, "rb") as stdin_fd:
+            try:
+                proc = subprocess.run(
+                    cmd,
+                    stdin=stdin_fd,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    timeout=timeout,
+                )
+            except subprocess.TimeoutExpired:
+                return None, None, "TIMEOUT (>{}s)".format(timeout)
+        if proc.returncode != 0:
+            err_text = proc.stderr.decode(errors="ignore").strip().splitlines()
+            tail = err_text[-1] if err_text else "no stderr"
+            return None, None, "exit {}: {}".format(proc.returncode, tail)
+        instructions = None
+        if os.path.isfile(callgrind_file):
+            with open(callgrind_file, "r", errors="ignore") as cg_fd:
+                instructions = parse_callgrind_output(cg_fd.read())
+        return proc.stdout, instructions, None
+    finally:
+        if os.path.exists(callgrind_file):
+            try:
+                os.unlink(callgrind_file)
+            except OSError:
+                pass
+
+
+def measure_case_callgrind(
+    time_bin, has_valgrind, script, case_name, input_path, output_path,
+    repeat, callgrind_repeat, timeout,
+):
+    """Measure one case: GNU-timed native runs plus Callgrind Ir runs.
+
+    A timed-run failure (timeout/crash/mismatch) fails the case, as
+    before; callgrind failures fail it too (CPython has no timeout
+    budget problem at --timeout 300, so no skip-degradation like the
+    JVM twin's slow legs). Returns (summary, error).
+    """
     with open(output_path, "rb") as fd:
         expected = run_tests.normalize(fd.read())
 
-    runs = []
-    for _ in range(repeat):
-        callgrind_file = None
-        fd_temp = None
-        try:
-            if has_valgrind:
-                fd_temp, callgrind_file = tempfile.mkstemp(prefix="snip-cg-", suffix=".out")
-                os.close(fd_temp)
-                cmd = [
-                    "valgrind",
-                    "--tool=callgrind",
-                    f"--callgrind-out-file={callgrind_file}",
-                    sys.executable,
-                    script,
-                ]
-            else:
-                cmd = [sys.executable, script]
+    walls, cpus, rss = [], [], []
+    for i in range(repeat):
+        stdout, metrics, err = timed_run_once(time_bin, script, input_path, timeout)
+        if err is not None:
+            return None, err
+        if i == 0 and run_tests.normalize(stdout) != expected:
+            got = run_tests.normalize(stdout).decode(errors="ignore")
+            want = expected.decode(errors="ignore")
+            return None, "output mismatch: expected {!r} got {!r}".format(want[:100], got[:100])
+        walls.append(metrics["wall_s"])
+        cpus.append(metrics["cpu_s"])
+        rss.append(metrics["maxrss_kb"])
 
-            t0 = time.perf_counter()
-            with open(input_path, "rb") as stdin_fd:
-                try:
-                    proc = subprocess.run(
-                        cmd,
-                        stdin=stdin_fd,
-                        stdout=subprocess.PIPE,
-                        stderr=subprocess.PIPE,
-                        timeout=timeout,
-                    )
-                except subprocess.TimeoutExpired:
-                    return None, f"TIMEOUT (>{timeout}s)"
-            wall_s = time.perf_counter() - t0
-
-            if proc.returncode != 0:
-                err_text = proc.stderr.decode(errors="ignore").strip().splitlines()
-                return None, f"exit {proc.returncode}: {err_text[-1] if err_text else 'no stderr'}"
-
-            if run_tests.normalize(proc.stdout) != expected:
-                got = run_tests.normalize(proc.stdout).decode(errors="ignore")
+    insn_vals = []
+    if has_valgrind:
+        for i in range(callgrind_repeat):
+            stdout, ir, err = callgrind_run_once(script, input_path, timeout)
+            if err is not None:
+                return None, err
+            if i == 0 and run_tests.normalize(stdout) != expected:
+                got = run_tests.normalize(stdout).decode(errors="ignore")
                 want = expected.decode(errors="ignore")
-                return None, f"output mismatch: expected {want[:100]!r} got {got[:100]!r}"
+                return (
+                    None,
+                    "callgrind output mismatch: expected {!r} got {!r}".format(
+                        want[:100], got[:100]
+                    ),
+                )
+            if ir is not None:
+                insn_vals.append(ir)
 
-            instructions = None
-            if has_valgrind and callgrind_file and os.path.isfile(callgrind_file):
-                with open(callgrind_file, "r", errors="ignore") as cg_fd:
-                    instructions = parse_callgrind_output(cg_fd.read())
-
-            runs.append({
-                "instructions": instructions,
-                "wall_s": wall_s,
-                "cpu_s": wall_s,  # fallback approximation
-                "maxrss_kb": 0,
-            })
-        finally:
-            if callgrind_file and os.path.exists(callgrind_file):
-                try:
-                    os.unlink(callgrind_file)
-                except OSError:
-                    pass
-
-    # Summarize runs
-    insn_vals = [r["instructions"] for r in runs if r["instructions"] is not None]
     summary = {
-        "instructions": summarize_numbers(insn_vals) if insn_vals else None,
-        "wall_s": summarize_numbers([r["wall_s"] for r in runs]),
-        "cpu_s": summarize_numbers([r["cpu_s"] for r in runs]),
-        "maxrss_kb": summarize_numbers([r["maxrss_kb"] for r in runs]),
-        "runs": len(runs),
+        "callgrind_instructions": summarize_numbers(insn_vals) if insn_vals else None,
+        "wall_s": summarize_numbers(walls),
+        "cpu_s": summarize_numbers(cpus),
+        "maxrss_kb": summarize_numbers(rss),
+        "runs": repeat,
+        "callgrind_runs": callgrind_repeat if has_valgrind else 0,
     }
     return summary, None
 
 
 def build_bmf(results):
-    """Aggregate per-snippet summaries into Bencher Metric Format JSON."""
+    """Aggregate per-snippet summaries into Bencher Metric Format JSON.
+
+    Comparison rule (issue #40): callgrind_instructions is the sum of
+    per-case MINIMUMS, cpu_time the sum of per-case medians, and
+    peak_memory the max per-case median in bytes -- the same
+    aggregations as the clojure twin, so values compare directly.
+    """
     snippets = {}
     for r in results:
         label = r["label"]
@@ -184,24 +334,49 @@ def build_bmf(results):
     bmf = {}
     for name in sorted(snippets):
         items = snippets[name]
-        total_instructions = 0
-        has_instructions = False
-        total_cpu = 0.0
+        insn_min, insn_max = [], []
+        cpu_min, cpu_med, cpu_max = [], [], []
+        rss_min, rss_med, rss_max = [], [], []
 
         for it in items:
             s = it.get("summary")
             if not s:
                 continue
-            if s.get("instructions") and s["instructions"]["median"] is not None:
-                total_instructions += int(s["instructions"]["median"])
-                has_instructions = True
-            if s.get("cpu_s") and s["cpu_s"]["median"] is not None:
-                total_cpu += float(s["cpu_s"]["median"])
+            cg = s.get("callgrind_instructions")
+            if cg and cg.get("min") is not None:
+                insn_min.append(cg["min"])
+                insn_max.append(cg["max"])
+            cpu = s.get("cpu_s")
+            if cpu and cpu.get("median") is not None:
+                cpu_min.append(cpu["min"])
+                cpu_med.append(cpu["median"])
+                cpu_max.append(cpu["max"])
+            rss = s.get("maxrss_kb")
+            if rss and rss.get("median") is not None:
+                rss_min.append(rss["min"])
+                rss_med.append(rss["median"])
+                rss_max.append(rss["max"])
 
         measures = {}
-        if has_instructions:
-            measures["instructions"] = {"value": total_instructions}
-        measures["cpu_time"] = {"value": total_cpu}
+        if insn_min:
+            lo = int(sum(insn_min))
+            measures["callgrind_instructions"] = {
+                "value": lo,
+                "lower_value": lo,
+                "upper_value": int(sum(insn_max)),
+            }
+        if cpu_med:
+            measures["cpu_time"] = {
+                "value": float(sum(cpu_med)),
+                "lower_value": float(sum(cpu_min)),
+                "upper_value": float(sum(cpu_max)),
+            }
+        if rss_med:
+            measures["peak_memory"] = {
+                "value": max(rss_med) * 1024,
+                "lower_value": max(rss_min) * 1024,
+                "upper_value": max(rss_max) * 1024,
+            }
 
         bmf[name] = measures
     return bmf
@@ -238,12 +413,13 @@ def append_summary(path, report, bmf):
     lines = [
         "### Callgrind Performance Summary (Python)",
         "",
-        "| Benchmark | Cases | Instructions (Ir) | CPU Time (s) |",
-        "| :--- | :---: | :---: | :---: |",
+        "| Benchmark | Cases | Instructions (Ir) | CPU Time (s) | Peak RSS (MB) |",
+        "| :--- | :---: | :---: | :---: | :---: |",
     ]
 
     total_insn = 0
     total_cpu = 0.0
+    peak_rss = 0
     has_insn = False
 
     snippets = {}
@@ -254,17 +430,25 @@ def append_summary(path, report, bmf):
         cases_count = len(snippets[name])
         m = bmf.get(name, {})
         insn_str = "-"
-        if "instructions" in m:
-            val = m["instructions"]["value"]
-            insn_str = f"{val:,}"
+        if "callgrind_instructions" in m:
+            val = m["callgrind_instructions"]["value"]
+            insn_str = "{:,}".format(val)
             total_insn += val
             has_insn = True
         cpu_val = m.get("cpu_time", {}).get("value", 0.0)
         total_cpu += cpu_val
-        lines.append(f"| `{name}` | {cases_count} | {insn_str} | {cpu_val:.4f} |")
+        rss_mb = m.get("peak_memory", {}).get("value", 0) / (1024 * 1024)
+        peak_rss = max(peak_rss, m.get("peak_memory", {}).get("value", 0))
+        lines.append(
+            "| `{}` | {} | {} | {:.4f} | {:.1f} |".format(name, cases_count, insn_str, cpu_val, rss_mb)
+        )
 
-    tot_insn_str = f"{total_insn:,}" if has_insn else "-"
-    lines.append(f"| **Total ({len(snippets)} snippets)** | - | **{tot_insn_str}** | **{total_cpu:.4f}** |")
+    tot_insn_str = "{:,}".format(total_insn) if has_insn else "-"
+    lines.append(
+        "| **Total ({} snippets)** | - | **{}** | **{:.4f}** | **{:.1f}** |".format(
+            len(snippets), tot_insn_str, total_cpu, peak_rss / (1024 * 1024)
+        )
+    )
     lines.append("")
 
     with open(path, "a") as f:
@@ -273,13 +457,55 @@ def append_summary(path, report, bmf):
 
 def self_test():
     print("Running self-test for measure.py...")
+
     sample_cg = """
 events: Ir
 summary: 987654321
 totals: 987654321
 """
     parsed = parse_callgrind_output(sample_cg)
-    assert parsed == 987654321, f"Expected 987654321, got {parsed}"
+    assert parsed == 987654321, "Expected 987654321, got {}".format(parsed)
+
+    sample_time = "wall=1.23 user=0.90 sys=0.10 maxrss_kb=123456 cpu_pct=81% major_faults=2 minor_faults=300\n"
+    tm = parse_time_text(sample_time)
+    assert tm["wall_s"] == 1.23, tm
+    assert tm["cpu_s"] == 1.0, tm
+    assert tm["maxrss_kb"] == 123456, tm
+    assert tm["cpu_pct"] == 81.0, tm
+    for bad in ["garbage line\n", "wall=1.0 user=0.5\n"]:
+        try:
+            parse_time_text(bad)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("parse_time_text accepted {!r}".format(bad))
+
+    # resolve_time_bin against hermetic fake `time` binaries.
+    fake_dir = tempfile.mkdtemp(prefix="snip-time-test-")
+    try:
+        gnu = os.path.join(fake_dir, "gnu-time")
+        with open(gnu, "w") as fd:
+            fd.write("#!/bin/sh\necho 'GNU time 1.9'\n")
+        os.chmod(gnu, 0o755)
+        assert resolve_time_bin(gnu) == gnu
+        bsd = os.path.join(fake_dir, "bsd-time")
+        with open(bsd, "w") as fd:
+            fd.write("#!/bin/sh\necho 'usage: time' >&2\nexit 1\n")
+        os.chmod(bsd, 0o755)
+        try:
+            resolve_time_bin(bsd)
+        except RuntimeError:
+            pass
+        else:
+            raise AssertionError("resolve_time_bin accepted non-GNU time")
+        try:
+            resolve_time_bin(os.path.join(fake_dir, "missing"))
+        except RuntimeError:
+            pass
+        else:
+            raise AssertionError("resolve_time_bin accepted a missing binary")
+    finally:
+        shutil.rmtree(fake_dir, ignore_errors=True)
 
     sample_tasks = [
         ("sort/merge_sort", "solution", "s1", "tc0", "in", "out"),
@@ -295,28 +521,76 @@ totals: 987654321
     labels_sh1 = {t[0] for t in sh1}
     assert labels_sh0.isdisjoint(labels_sh1)
 
-    # Test BMF generation
+    # BMF: Ir sums per-case MINs (comparison rule), cpu sums
+    # medians, peak takes the max median in bytes -- all with
+    # lower/upper bounds mirroring the clojure twin.
     mock_results = [
         {
             "label": "sort/merge_sort",
             "case": "tc0",
             "summary": {
-                "instructions": {"median": 1000},
-                "cpu_s": {"median": 0.05},
+                "callgrind_instructions": {"min": 900, "median": 1000, "max": 1100},
+                "cpu_s": {"min": 0.04, "median": 0.05, "max": 0.06},
+                "maxrss_kb": {"min": 90, "median": 100, "max": 110},
             },
         },
         {
             "label": "sort/merge_sort",
             "case": "tc1",
             "summary": {
-                "instructions": {"median": 2000},
-                "cpu_s": {"median": 0.05},
+                "callgrind_instructions": {"min": 1900, "median": 2000, "max": 2100},
+                "cpu_s": {"min": 0.06, "median": 0.07, "max": 0.08},
+                "maxrss_kb": {"min": 190, "median": 200, "max": 210},
+            },
+        },
+        {
+            "label": "sort/quick_sort",
+            "case": "tc0",
+            "summary": {
+                "callgrind_instructions": None,
+                "cpu_s": {"min": 0.01, "median": 0.02, "max": 0.03},
+                "maxrss_kb": {"min": 50, "median": 60, "max": 70},
             },
         },
     ]
     bmf = build_bmf(mock_results)
-    assert bmf["sort/merge_sort"]["instructions"]["value"] == 3000
-    assert abs(bmf["sort/merge_sort"]["cpu_time"]["value"] - 0.10) < 1e-6
+    merge_entry = bmf["sort/merge_sort"]
+    assert merge_entry["callgrind_instructions"]["value"] == 2800, merge_entry
+    assert merge_entry["callgrind_instructions"]["lower_value"] == 2800, merge_entry
+    assert merge_entry["callgrind_instructions"]["upper_value"] == 3200, merge_entry
+    assert abs(merge_entry["cpu_time"]["value"] - 0.12) < 1e-9, merge_entry
+    assert merge_entry["peak_memory"]["value"] == 200 * 1024, merge_entry
+    assert merge_entry["peak_memory"]["lower_value"] == 190 * 1024, merge_entry
+    assert merge_entry["peak_memory"]["upper_value"] == 210 * 1024, merge_entry
+    # No Ir anywhere: the measure stays absent (like the twin).
+    assert "callgrind_instructions" not in bmf["sort/quick_sort"], bmf["sort/quick_sort"]
+    assert "cpu_time" in bmf["sort/quick_sort"]
+
+    # Merge fan-in: dedupe by (label, case), union BMF keys.
+    rep_a = {
+        "results": [mock_results[0], mock_results[2]],
+        "failures": ["x: boom"],
+    }
+    rep_b = {
+        "results": [mock_results[0], mock_results[1]],
+        "failures": [],
+    }
+    merge_dir = tempfile.mkdtemp(prefix="snip-merge-test-")
+    try:
+        pa = os.path.join(merge_dir, "a.json")
+        pb = os.path.join(merge_dir, "b.json")
+        with open(pa, "w") as fd:
+            json.dump(rep_a, fd)
+        with open(pb, "w") as fd:
+            json.dump(rep_b, fd)
+        merged, merged_bmf = merge_reports([pa, pb])
+        assert len(merged["results"]) == 3, merged
+        assert merged["failures"] == ["x: boom"], merged
+        assert (
+            merged_bmf["sort/merge_sort"]["callgrind_instructions"]["value"] == 2800
+        ), merged_bmf
+    finally:
+        shutil.rmtree(merge_dir, ignore_errors=True)
 
     print("self-test passed!")
     return 0
@@ -327,8 +601,13 @@ def main(argv=None):
     parser.add_argument("--resources", default=os.path.join(ROOT, "tests", "resources"))
     parser.add_argument("--jobs", type=int, default=2)
     parser.add_argument("--repeat", type=int, default=1)
+    parser.add_argument(
+        "--callgrind-repeat", type=int, default=1,
+        help="Valgrind Callgrind runs per case for Ir (timed runs use --repeat)",
+    )
     parser.add_argument("--timeout", type=int, default=300)
     parser.add_argument("--only", default="", help="filter by label substring")
+    parser.add_argument("--time-bin", default="", help="GNU time binary (default: auto-detect)")
     parser.add_argument("--shard", default="", help="shard K/N (0-based K)")
     parser.add_argument("--output", default=None, help="JSON output file")
     parser.add_argument("--bmf-output", default=None, help="Bencher Metric Format output")
@@ -350,17 +629,39 @@ def main(argv=None):
                 json.dump(bmf, f, indent=2)
         if args.summary_file:
             append_summary(args.summary_file, report, bmf)
-        print(f"Merged {len(args.merge)} reports: {len(report['results'])} cases, {len(bmf)} benchmarks.")
+        print(
+            "Merged {} reports: {} cases, {} benchmarks.".format(
+                len(args.merge), len(report["results"]), len(bmf)
+            )
+        )
         return 0
+
+    if args.repeat < 1:
+        print("measure.py: --repeat must be >= 1", file=sys.stderr)
+        return 2
+    if args.callgrind_repeat < 1:
+        print("measure.py: --callgrind-repeat must be >= 1", file=sys.stderr)
+        return 2
+
+    try:
+        time_bin = resolve_time_bin(args.time_bin)
+    except RuntimeError as exc:
+        print("measure.py: {}".format(exc), file=sys.stderr)
+        return 1
 
     has_valgrind = shutil.which("valgrind") is not None
     if not has_valgrind:
-        print("warning: valgrind not found in PATH; running Python directly without Callgrind simulation", file=sys.stderr)
+        print(
+            "warning: valgrind not found in PATH; recording timed signals without Callgrind Ir",
+            file=sys.stderr,
+        )
 
     tasks = []
     missing = []
     for area, problem, stem, script, cases in run_tests.discover(args.resources):
-        label = f"{area}/{problem}/{stem}" if problem != stem else f"{area}/{problem}"
+        label = "{}/{}/{}".format(area, problem, stem) if problem != stem else "{}/{}".format(
+            area, problem
+        )
         if args.only and args.only not in label and args.only not in script:
             continue
         if not cases:
@@ -375,7 +676,13 @@ def main(argv=None):
         tasks = select_shard(tasks, index, total)
 
     total_tasks = len(tasks)
-    print(f"Measuring {total_tasks} cases ({len({t[0] for t in tasks})} benchmarks) with Callgrind...")
+    print(
+        "Measuring {} cases ({} benchmarks) with GNU time{}...".format(
+            total_tasks,
+            len({t[0] for t in tasks}),
+            " + Callgrind" if has_valgrind else "",
+        )
+    )
 
     results = []
     failures = []
@@ -385,12 +692,14 @@ def main(argv=None):
         futures = {
             pool.submit(
                 measure_case_callgrind,
+                time_bin,
                 has_valgrind,
                 script,
                 case_name,
                 inp,
                 outp,
                 args.repeat,
+                args.callgrind_repeat,
                 args.timeout,
             ): (label, stem, script, case_name)
             for label, stem, script, case_name, inp, outp in tasks
@@ -400,19 +709,21 @@ def main(argv=None):
             summary, err = future.result()
             done += 1
             if err is None:
-                insn = summary["instructions"]["median"] if summary.get("instructions") else None
-                insn_s = f"{int(insn):,} Ir" if insn else "n/a"
-                print(f"[{done}/{total_tasks}] {label}/{case_name}: {insn_s}")
-                results.append({
-                    "label": label,
-                    "stem": stem,
-                    "case": case_name,
-                    "script": os.path.relpath(script, ROOT),
-                    "summary": summary,
-                })
+                cg = summary.get("callgrind_instructions")
+                insn_s = "{:,} Ir".format(int(cg["min"])) if cg else "n/a"
+                print("[{}/{}] {}/{}: {}".format(done, total_tasks, label, case_name, insn_s))
+                results.append(
+                    {
+                        "label": label,
+                        "stem": stem,
+                        "case": case_name,
+                        "script": os.path.relpath(script, ROOT),
+                        "summary": summary,
+                    }
+                )
             else:
-                print(f"[{done}/{total_tasks}] FAIL {label}/{case_name}: {err}")
-                failures.append(f"{label}/{case_name}: {err}")
+                print("[{}/{}] FAIL {}/{}: {}".format(done, total_tasks, label, case_name, err))
+                failures.append("{}/{}: {}".format(label, case_name, err))
 
     report = {
         "tool_version": TOOL_VERSION,

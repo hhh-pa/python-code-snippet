@@ -53,11 +53,14 @@ See `tools/build_bundle.sh` for rotation instructions when using a fresh passphr
 
 ## Performance Tracking (Callgrind)
 
-`tools/measure.py` measures load-independent algorithmic complexity using Valgrind Callgrind:
+`tools/measure.py` measures load-independent algorithmic complexity using Valgrind Callgrind. Each case runs natively once under GNU time (required: `apt install time`) plus once under Callgrind per repeat:
 
-- `instructions` (`Ir` — simulated instruction reads) — completely load-invariant and deterministic across runs and runners.
-- `cpu_time` (user + sys CPU time)
-- `wall_time`
+- `callgrind_instructions` (`Ir` — simulated instruction reads) — completely load-invariant and deterministic across runs and runners.
+- `cpu_time` (user + sys CPU time from GNU time)
+- `peak_memory` (max RSS in bytes from GNU time)
+- `wall_s`
+
+Comparison rule ([clojure-code-snippet#40](https://github.com/hhh-pa/clojure-code-snippet/issues/40)): Ir is the sum of per-case minimums (least-disturbed run) on CPython exactly as on JVM and clojure-rs, so BMF values compare directly across runtimes. cpu_time sums per-case medians; peak_memory takes the max per-case median. Benchmark names stay stable.
 
 ```sh
 python3 tools/measure.py --resources tests/resources --repeat 1 \
@@ -65,4 +68,4 @@ python3 tools/measure.py --resources tests/resources --repeat 1 \
 python3 tools/measure.py --self-test
 ```
 
-CI runs correctness across sharded runners in the `test-shard` jobs, aggregated by `test`. Then the `perf-callgrind` job measures instruction counts under Valgrind Callgrind across 4 shards, reporting to Bencher under testbed `ubuntu-latest-python` and measure `instructions` (gated by `BENCHER_API_KEY`). A fan-in `report` job merges all shard results, verifies equality against the plain BMF union (`jq -s 'add'`), and publishes a combined Markdown summary table to the GitHub Actions job summary.
+CI runs correctness across sharded runners in the `test-shard` jobs, aggregated by `test`. Then the `perf-callgrind` job measures instruction counts under Valgrind Callgrind across 4 shards, reporting to Bencher under testbed `ubuntu-latest-python` and measure `callgrind_instructions` (gated by `BENCHER_API_KEY`; a maintainer must create the `python-code-snippet` Bencher project and set the secret before history starts). A fan-in `report` job merges all shard results, verifies equality against the plain BMF union (`jq -s 'add'`), and publishes a combined Markdown summary table to the GitHub Actions job summary.
