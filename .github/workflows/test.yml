@@ -97,16 +97,28 @@ jobs:
       - name: Install Valgrind
         uses: awalsh128/cache-apt-pkgs-action@v1.6.3
         with:
-          packages: valgrind
-          version: 1.0
+          # time: GNU time wraps every native run (cpu/maxrss); the
+          # memory signal is unreconcilable without it (issue #40).
+          packages: time valgrind
+          version: 1.1
 
       - name: Measure performance (Callgrind instructions)
+        # Lean recipe mirroring the clojure twin: one GNU-timed
+        # native run (stdout gate + wall/cpu/maxrss) plus one
+        # Callgrind run (Ir) per case.
         run: |
           python3 tools/measure.py --resources tests/resources \
-            --repeat 1 --jobs 2 --timeout 300 \
+            --repeat 1 --callgrind-repeat 1 --jobs 2 --timeout 300 \
             --shard ${{ matrix.shard }}/4 \
             --output perf-results.json --bmf-output bencher-bmf.json \
             --summary-file "$GITHUB_STEP_SUMMARY"
+
+      - name: Warn when Bencher history is disabled
+        if: env.BENCHER_API_KEY == ''
+        env:
+          BENCHER_API_KEY: ${{ secrets.BENCHER_API_KEY }}
+        run: |
+          echo "::warning::BENCHER_API_KEY secret is not set: Bencher history stays empty (maintainer action: create the python-code-snippet project on Bencher and set the secret)"
 
       - name: Install Bencher CLI
         if: env.BENCHER_API_KEY != ''
@@ -114,11 +126,28 @@ jobs:
           BENCHER_API_KEY: ${{ secrets.BENCHER_API_KEY }}
         uses: bencherdev/bencher@main
 
+      # Threshold policy (issue #40): callgrind_instructions
+      # (percentage) only, same shape as the clojure twin's sweep
+      # (min/max sample 10/64, 1% upper boundary over the ~zero
+      # deterministic-Ir wobble). The cpu_time/peak_memory entries
+      # are stripped before reporting: the sweep is repeat-1
+      # timing, not a timing signal; the full BMF stays in the
+      # uploaded artifacts for RSS reconciliation.
+      - name: Strip BMF to tracked measures
+        run: |
+          jq 'with_entries(select(.value.callgrind_instructions != null) | .value |= {callgrind_instructions})' \
+            bencher-bmf.json > bencher-bench.json
+          echo "tracked benchmarks: $(jq 'length' bencher-bench.json)"
+
       - name: Track benchmarks with Bencher
         if: env.BENCHER_API_KEY != ''
         env:
           BENCHER_API_KEY: ${{ secrets.BENCHER_API_KEY }}
         run: |
+          if [ "$(jq 'length' bencher-bench.json)" = "0" ]; then
+            echo "no callgrind data in shard; skipping Bencher report"
+            exit 0
+          fi
           if [ "${{ github.event_name }}" = "pull_request" ]; then
             bencher run \
               --project python-code-snippet \
@@ -130,7 +159,7 @@ jobs:
               --start-point-clone-thresholds \
               --testbed ubuntu-latest-python \
               --adapter json \
-              --file bencher-bmf.json \
+              --file bencher-bench.json \
               --github-actions "${{ secrets.GITHUB_TOKEN }}"
           else
             bencher run \
@@ -138,13 +167,13 @@ jobs:
               --key '${{ secrets.BENCHER_API_KEY }}' \
               --branch "${{ github.ref_name }}" \
               --testbed ubuntu-latest-python \
-              --threshold-measure instructions \
+              --threshold-measure callgrind_instructions \
               --threshold-test percentage \
               --threshold-min-sample-size 10 \
               --threshold-max-sample-size 64 \
-              --threshold-upper-boundary 0.10 \
+              --threshold-upper-boundary 0.01 \
               --adapter json \
-              --file bencher-bmf.json \
+              --file bencher-bench.json \
               --github-actions "${{ secrets.GITHUB_TOKEN }}"
           fi
 
@@ -156,6 +185,7 @@ jobs:
           path: |
             perf-results.json
             bencher-bmf.json
+            bencher-bench.json
 
   report:
     needs: perf-callgrind
