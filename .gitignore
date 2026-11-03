@@ -2,3 +2,6 @@ __pycache__/
 *.pyc
 *.pyo
 .pytest_cache/
+tests/resources/
+perf-results*.json
+bencher-bmf*.json
