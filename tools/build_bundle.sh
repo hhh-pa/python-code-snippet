@@ -5,8 +5,10 @@
 # Usage: tools/build_bundle.sh <recipes resource/shared dir> [passphrase-file]
 #
 # With no passphrase file, a fresh 64-char passphrase is generated and
-# printed ONCE (save it, then set it as the RESOURCES_PASSPHRASE secret:
-#   gh secret set RESOURCES_PASSPHRASE --repo hhh-pa/python-code-snippet
+# printed ONCE (save it, then set it as the RESOURCES_PASSPHRASE
+# organization secret -- shared by the clojure/python/ocaml snippet
+# repos, so rebuild their bundles too:
+#   gh secret set RESOURCES_PASSPHRASE --org hhh-pa --visibility all
 # pasting the value when prompted).
 # With a passphrase file, the bundle is re-encrypted under the existing
 # secret value (use after resource/shared changes, no rotation needed).
