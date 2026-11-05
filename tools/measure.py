@@ -890,6 +890,8 @@ def main(argv=None):
                         help="inscount tool .so for Pin (-t)")
     parser.add_argument("--pin-repeat", type=int, default=PIN_REPEAT_DEFAULT)
     parser.add_argument("--pin-timeout", type=int, default=PIN_TIMEOUT_DEFAULT)
+    parser.add_argument("--no-alloc-shim", action="store_true",
+                        help="skip the LD_PRELOAD alloc shim: Pin counts instructions only, no allocated_bytes")
     parser.add_argument("--time-bin", default="",
                         help="GNU time binary for the timed phase (default: auto)")
     parser.add_argument("--label-style", default="python", choices=("python", "snip"),
@@ -935,7 +937,7 @@ def main(argv=None):
     effective_pin_repeat = args.pin_repeat if use_pin else 0
 
     alloc_shim = None
-    if use_pin:
+    if use_pin and not args.no_alloc_shim:
         try:
             alloc_shim = ensure_alloc_shim()
         except RuntimeError as exc:
