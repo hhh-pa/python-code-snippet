@@ -53,20 +53,19 @@ See `tools/build_bundle.sh` for rotation instructions when using a fresh passphr
 
 ## Performance Tracking (Intel Pin)
 
-`tools/measure.py` measures load-independent algorithmic complexity using Intel Pin with the vendored inscount tool (`scripts/ci/instrumentation/`):
+`tools/measure.py` measures load-independent algorithmic complexity using Intel Pin with the vendored inscount tool (`scripts/ci/instrumentation/`), in pin-only mode (`--repeat 0`): each case runs once under Pin, with an `LD_PRELOAD` allocation-counting shim in the same run:
 
 - `pin_instructions` (executed application instructions under Pin 4.4) — completely load-invariant and deterministic across runs and runners.
-- `cpu_time` (user + sys CPU time)
-- `wall_time`
+- `allocated_bytes` (cumulative libc allocation in the same Pin run) — the memory signal. It includes Pin's own JIT/VM allocations, so like `pin_instructions` it is only comparable within one Pin version.
 
-When Valgrind happens to be installed locally, a Callgrind `instructions` (`Ir`) signal is recorded too; CI no longer installs Valgrind, so that measure is absent there.
+Peak RSS is never read from instrumented runs — Pin's own footprint pollutes it — so timed signals (`cpu_time`, `wall_time`, `maxrss`) are absent from pin-only sweeps; the summary shows `-` and BMF omits those rows rather than emitting zeros. Locally, `--repeat N` (N ≥ 1) still runs a native timed phase first (plus a Callgrind `instructions` signal when Valgrind happens to be installed); CI no longer installs Valgrind, so that measure is absent there.
 
 ```sh
 bash scripts/ci/setup-instrumentation.sh  # one-time: fetch Pin 4.4 kit, build tool
-python3 tools/measure.py --resources tests/resources --repeat 1 \
+python3 tools/measure.py --resources tests/resources --repeat 0 \
   --pin --pin-bin "$INSTRUMENTATION_BIN" --pin-tool "$INSTRUMENTATION_TOOL" \
   --output perf.json --bmf-output bencher.json
 python3 tools/measure.py --self-test
 ```
 
-CI runs correctness across sharded runners in the `test-shard` jobs, aggregated by `test`. Then the `perf-instrumentation` job provisions the cached Pin 4.4 kit and measures instruction counts under Pin across 4 shards, reporting to Bencher under testbed `ubuntu-latest-python` and measure `pin_instructions` (gated by `BENCHER_API_KEY`). A fan-in `report-instrumentation` job merges all shard results, verifies equality against the plain BMF union (`jq -s 'add'`), and publishes a combined Markdown summary table to the GitHub Actions job summary.
+CI runs correctness across sharded runners in the `test-shard` jobs, aggregated by `test`. Then the `perf-instrumentation` job provisions the cached Pin 4.4 kit and measures instruction counts plus allocated bytes under Pin across 4 shards, reporting to Bencher under testbed `ubuntu-latest-python` and measures `pin_instructions` / `allocated_bytes` (gated by `BENCHER_API_KEY`). A fan-in `report-instrumentation` job merges all shard results, verifies equality against the plain BMF union (`jq -s 'add'`), and publishes a combined Markdown summary table to the GitHub Actions job summary.

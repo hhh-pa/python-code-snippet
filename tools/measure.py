@@ -6,9 +6,19 @@ metrics under Intel Pin (inscount tool):
 
   * pin_instructions (executed application instructions under Pin) --
     fully load-independent and deterministic across runs.
-  * cpu_s (user + sys CPU time).
-  * wall_s (wall time).
-  * maxrss_kb (peak RSS in KB).
+  * allocated_bytes (cumulative libc allocation in the same Pin run,
+    via the LD_PRELOAD alloc shim) -- the memory signal. It includes
+    Pin's own JIT/VM allocations, so like pin_instructions it is only
+    comparable within one Pin version.
+  * cpu_s (user + sys CPU time, timed phase only).
+  * wall_s (wall time, timed phase only).
+  * maxrss_kb (peak RSS in KB, timed phase only).
+
+Pin-only mode (--repeat 0, needs --pin): skips the native timed phase
+entirely, so each case is measured ONCE under Pin; correctness still
+gates on the instrumented run's stdout. Timed signals stay null and
+the renderers print "-" / omit BMF rows instead of zeros. Peak RSS is
+never read from instrumented runs -- Pin's own footprint pollutes it.
 
 Plus, when Valgrind is installed locally, Callgrind instruction reads
 ('Ir') as instructions min/median/max per case. CI no longer installs
@@ -17,7 +27,7 @@ paths stay for local use.
 
 Usage:
     python3 tools/measure.py --resources tests/resources \
-        [--repeat 1] [--jobs 2] [--timeout 300] [--only substring] \
+        [--repeat 0] [--jobs 2] [--only substring] \
         [--output perf.json] [--bmf-output bencher.json] \
         [--summary-file "$GITHUB_STEP_SUMMARY"] [--shard K/N] \
         --pin --pin-bin BIN --pin-tool SO [--pin-repeat N] \
@@ -47,8 +57,14 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "tests"))
 import run_tests
 
-TOOL_VERSION = 3
+TOOL_VERSION = 4
 _CALLGRIND_TOTAL_RE = re.compile(r"^(?:totals|summary):\s*(\d+)", re.MULTILINE)
+
+# LD_PRELOAD alloc-shim channel: the shim's destructor prints exactly
+# one "snip_alloc_total_bytes=N" line on the child's stderr.
+ALLOC_MARKER = "snip_alloc_total_bytes="
+ALLOC_SHIM_SRC = os.path.join(
+    ROOT, "scripts", "ci", "instrumentation", "allocshim.c")
 
 # Pin inscount defaults: two counts per case catch instrument
 # flakiness without paying for more slow runs; the Pin budget is
@@ -127,6 +143,61 @@ def pin_version(pin_bin):
         if line.strip():
             return line.strip()
     return None
+
+
+def parse_alloc_total(content):
+    """Extract the alloc shim's total from child stderr text.
+
+    The stderr channel is shared with the application, so malformed
+    marker lines are skipped (an app echoing the marker cannot break
+    the parse) and the last valid total wins. Raises ValueError when
+    no marker line parses.
+    """
+    found = None
+    for line in content.splitlines():
+        text = line.strip()
+        if not text.startswith(ALLOC_MARKER):
+            continue
+        digits = text[len(ALLOC_MARKER):]
+        if digits and all(c in "0123456789" for c in digits):
+            found = int(digits)
+    if found is None:
+        raise ValueError(
+            "alloc-shim total unreadable: no snip_alloc_total_bytes line")
+    return found
+
+
+def ensure_alloc_shim():
+    """Build the LD_PRELOAD allocation-counting shim on demand.
+
+    Compiles scripts/ci/instrumentation/allocshim.c with cc into a
+    fresh temp dir and returns the .so path. Raises RuntimeError when
+    the platform has no LD_PRELOAD (non-Linux), no C compiler, or the
+    build fails.
+    """
+    if not sys.platform.startswith("linux"):
+        raise RuntimeError("needs Linux (LD_PRELOAD)")
+    cc = shutil.which("cc") or shutil.which("gcc")
+    if cc is None:
+        raise RuntimeError("needs a C compiler (cc not found)")
+    if not os.path.isfile(ALLOC_SHIM_SRC):
+        raise RuntimeError("shim source missing at {}".format(ALLOC_SHIM_SRC))
+    build_dir = tempfile.mkdtemp(prefix="snip-alloc-shim-")
+    out = os.path.join(build_dir, "alloc_shim.so")
+    try:
+        proc = subprocess.run(
+            [cc, "-shared", "-fPIC", "-O2", "-o", out, ALLOC_SHIM_SRC, "-ldl"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=120,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise RuntimeError("build failed: {}".format(exc))
+    if proc.returncode != 0:
+        tail = proc.stderr.decode(errors="ignore").strip().splitlines()
+        raise RuntimeError("build failed: {}".format(
+            tail[-1] if tail else "cc exit {}".format(proc.returncode)))
+    return out
 
 
 def is_pin_timeout(run_err):
@@ -247,17 +318,29 @@ def measure_case_callgrind(has_valgrind, script, case_name, input_path, output_p
     return summary, None
 
 
-def pin_once(pin_bin, pin_tool, exec_cmd, input_bytes, timeout):
+def pin_once(pin_bin, pin_tool, exec_cmd, input_bytes, timeout, alloc_shim=None):
     """Run exec_cmd once under Pin with the inscount tool.
 
-    Returns (stdout, count, run_err): run_err is "" on success, else a
-    short "TIMEOUT (>Ns)" / "exit N: ..." / "pin output unreadable"
-    text for the caller to classify.
+    When alloc_shim names a built shim .so, it is LD_PRELOADed into
+    the same run, so the one instrumented execution yields both the
+    instruction count and the cumulative allocated bytes.
+
+    Returns (stdout, count, alloc_bytes|None, run_err): run_err is ""
+    on success, else a short "TIMEOUT (>Ns)" / "exit N: ..." /
+    "pin output unreadable" / "pin alloc output unreadable" text for
+    the caller to classify. A missing shim total after a successful
+    exit fails the case: the harness is broken, not the snippet, and
+    silently dropping a tracked measure is worse than a red case.
     """
     fd_temp, out_file = tempfile.mkstemp(prefix="snip-pin-", suffix=".out")
     os.close(fd_temp)
     try:
         cmd = [pin_bin, "-t", pin_tool, "-o", out_file, "--"] + list(exec_cmd)
+        env = None
+        if alloc_shim:
+            env = dict(os.environ)
+            prev = env.get("LD_PRELOAD")
+            env["LD_PRELOAD"] = alloc_shim if not prev else alloc_shim + ":" + prev
         try:
             proc = subprocess.run(
                 cmd,
@@ -265,19 +348,27 @@ def pin_once(pin_bin, pin_tool, exec_cmd, input_bytes, timeout):
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 timeout=timeout,
+                env=env,
             )
         except subprocess.TimeoutExpired:
-            return None, 0, "TIMEOUT (>{}s)".format(timeout)
+            return None, 0, None, "TIMEOUT (>{}s)".format(timeout)
         if proc.returncode != 0:
             err_text = proc.stderr.decode(errors="ignore").strip().splitlines()
-            return None, 0, "exit {}: {}".format(
+            return None, 0, None, "exit {}: {}".format(
                 proc.returncode, err_text[-1] if err_text else "no stderr")
         try:
             with open(out_file, "r", errors="ignore") as fd:
                 count = parse_pin_count(fd.read())
         except (OSError, ValueError) as exc:
-            return None, 0, "pin output unreadable: {}".format(exc)
-        return proc.stdout, count, ""
+            return None, 0, None, "pin output unreadable: {}".format(exc)
+        alloc_bytes = None
+        if alloc_shim:
+            try:
+                alloc_bytes = parse_alloc_total(
+                    proc.stderr.decode(errors="ignore"))
+            except ValueError as exc:
+                return None, 0, None, "pin alloc output unreadable: {}".format(exc)
+        return proc.stdout, count, alloc_bytes, ""
     finally:
         if os.path.exists(out_file):
             try:
@@ -287,12 +378,14 @@ def pin_once(pin_bin, pin_tool, exec_cmd, input_bytes, timeout):
 
 
 def measure_case_pin(exec_cmd, label, case_name, input_path, output_path,
-                     pin_bin, pin_tool, pin_repeat, pin_timeout):
-    """Pin inscount phase for one case.
+                     pin_bin, pin_tool, pin_repeat, pin_timeout, alloc_shim=None):
+    """Pin inscount (+ alloc shim) phase for one case.
 
-    Returns (pin_summary|None, pin_skipped|None, error|None): timeouts
-    degrade to pin_skipped (callgrind data stays valid), crashes and
-    output mismatches fail the case.
+    Returns (signals|None, pin_skipped|None, error|None): signals maps
+    "pin_instructions" and, when the shim ran, "allocated_bytes" to
+    min/median/max summaries. Timeouts degrade to pin_skipped (timed
+    data, if any, stays valid); crashes and output mismatches fail
+    the case.
     """
     with open(output_path, "rb") as fd:
         expected = run_tests.normalize(fd.read())
@@ -300,9 +393,10 @@ def measure_case_pin(exec_cmd, label, case_name, input_path, output_path,
         input_bytes = fd.read()
 
     counts = []
+    allocs = []
     for i in range(pin_repeat):
-        stdout, count, run_err = pin_once(
-            pin_bin, pin_tool, exec_cmd, input_bytes, pin_timeout)
+        stdout, count, alloc_bytes, run_err = pin_once(
+            pin_bin, pin_tool, exec_cmd, input_bytes, pin_timeout, alloc_shim)
         if run_err:
             if is_pin_timeout(run_err):
                 print("warning: {}/{}: pin skipped ({})".format(
@@ -315,30 +409,48 @@ def measure_case_pin(exec_cmd, label, case_name, input_path, output_path,
             return None, None, "pin output mismatch: expected {!r} got {!r}".format(
                 want[:100], got[:100])
         counts.append(count)
-    return summarize_numbers(counts), None, None
+        if alloc_bytes is not None:
+            allocs.append(alloc_bytes)
+    signals = {"pin_instructions": summarize_numbers(counts)}
+    if allocs:
+        signals["allocated_bytes"] = summarize_numbers(allocs)
+    return signals, None, None
 
 
 def measure_case_full(has_valgrind, label, script, case_name, inp, outp,
-                      repeat, timeout, pin_bin, pin_tool, pin_repeat, pin_timeout):
+                      repeat, timeout, pin_bin, pin_tool, pin_repeat, pin_timeout,
+                      alloc_shim=None):
     """Direct/Callgrind measure plus the Pin inscount phase.
 
     The first phase runs the case natively (or under Callgrind when
     valgrind is installed) for correctness and wall/cpu time; the Pin
-    phase provides the deterministic instruction count.
+    phase provides the deterministic instruction count. With
+    --repeat 0 (pin-only) the first phase is skipped entirely -- no
+    native run, no valgrind -- correctness gates on the first Pin
+    run, and timed signals stay None.
 
     Returns (summary|None, pin_skipped|None, error|None).
     """
-    summary, err = measure_case_callgrind(
-        has_valgrind, script, case_name, inp, outp, repeat, timeout)
-    if err is not None or pin_repeat <= 0:
-        return summary, None, err
-    pin_summary, pin_skipped, pin_err = measure_case_pin(
+    if repeat > 0:
+        summary, err = measure_case_callgrind(
+            has_valgrind, script, case_name, inp, outp, repeat, timeout)
+        if err is not None or pin_repeat <= 0:
+            return summary, None, err
+    else:
+        summary = {
+            "instructions": None,
+            "wall_s": None,
+            "cpu_s": None,
+            "maxrss_kb": None,
+            "runs": 0,
+        }
+    signals, pin_skipped, pin_err = measure_case_pin(
         [sys.executable, script], label, case_name, inp, outp,
-        pin_bin, pin_tool, pin_repeat, pin_timeout)
+        pin_bin, pin_tool, pin_repeat, pin_timeout, alloc_shim)
     if pin_err is not None:
         return None, None, pin_err
-    if pin_summary is not None:
-        summary["pin_instructions"] = pin_summary
+    if signals is not None:
+        summary.update(signals)
     return summary, pin_skipped, None
 
 
@@ -356,7 +468,10 @@ def build_bmf(results):
         has_instructions = False
         total_pin = 0
         has_pin = False
+        total_alloc = 0
+        has_alloc = False
         total_cpu = 0.0
+        has_cpu = False
 
         for it in items:
             s = it.get("summary")
@@ -368,16 +483,29 @@ def build_bmf(results):
             if s.get("pin_instructions") and s["pin_instructions"]["median"] is not None:
                 total_pin += int(s["pin_instructions"]["median"])
                 has_pin = True
+            if s.get("allocated_bytes") and s["allocated_bytes"]["median"] is not None:
+                total_alloc += int(s["allocated_bytes"]["median"])
+                has_alloc = True
             if s.get("cpu_s") and s["cpu_s"]["median"] is not None:
                 total_cpu += float(s["cpu_s"]["median"])
+                has_cpu = True
 
         measures = {}
         if has_instructions:
             measures["instructions"] = {"value": total_instructions}
         if has_pin:
             measures["pin_instructions"] = {"value": total_pin}
-        measures["cpu_time"] = {"value": total_cpu}
+        if has_alloc:
+            measures["allocated_bytes"] = {"value": total_alloc}
+        # Pin-only summaries have no timed phase: no cpu_time row at
+        # all, never a zero one.
+        if has_cpu:
+            measures["cpu_time"] = {"value": total_cpu}
 
+        # A snippet whose cases all pin-skipped in pin-only mode has
+        # no signal to track; leaving it out beats an empty entry.
+        if not measures:
+            continue
         bmf[name] = measures
     return bmf
 
@@ -413,15 +541,18 @@ def append_summary(path, report, bmf):
     lines = [
         "### Instrumentation Performance Summary (Python)",
         "",
-        "| Benchmark | Cases | Pin Instr | Callgrind Ir | CPU Time (s) |",
-        "| :--- | :---: | :---: | :---: | :---: |",
+        "| Benchmark | Cases | Pin Instr | Allocated (B) | Callgrind Ir | CPU Time (s) |",
+        "| :--- | :---: | :---: | :---: | :---: | :---: |",
     ]
 
     total_insn = 0
     total_pin = 0
+    total_alloc = 0
     total_cpu = 0.0
     has_insn = False
     has_pin = False
+    has_alloc = False
+    has_cpu = False
 
     snippets = {}
     for r in report.get("results", []):
@@ -436,19 +567,31 @@ def append_summary(path, report, bmf):
             pin_str = f"{val:,}"
             total_pin += val
             has_pin = True
+        alloc_str = "-"
+        if "allocated_bytes" in m:
+            val = m["allocated_bytes"]["value"]
+            alloc_str = f"{val:,}"
+            total_alloc += val
+            has_alloc = True
         insn_str = "-"
         if "instructions" in m:
             val = m["instructions"]["value"]
             insn_str = f"{val:,}"
             total_insn += val
             has_insn = True
-        cpu_val = m.get("cpu_time", {}).get("value", 0.0)
-        total_cpu += cpu_val
-        lines.append(f"| `{name}` | {cases_count} | {pin_str} | {insn_str} | {cpu_val:.4f} |")
+        cpu_str = "-"
+        if "cpu_time" in m:
+            cpu_val = m["cpu_time"]["value"]
+            cpu_str = f"{cpu_val:.4f}"
+            total_cpu += cpu_val
+            has_cpu = True
+        lines.append(f"| `{name}` | {cases_count} | {pin_str} | {alloc_str} | {insn_str} | {cpu_str} |")
 
     tot_pin_str = f"{total_pin:,}" if has_pin else "-"
+    tot_alloc_str = f"{total_alloc:,}" if has_alloc else "-"
     tot_insn_str = f"{total_insn:,}" if has_insn else "-"
-    lines.append(f"| **Total ({len(snippets)} snippets)** | - | **{tot_pin_str}** | **{tot_insn_str}** | **{total_cpu:.4f}** |")
+    tot_cpu_str = f"{total_cpu:.4f}" if has_cpu else "-"
+    lines.append(f"| **Total ({len(snippets)} snippets)** | - | **{tot_pin_str}** | **{tot_alloc_str}** | **{tot_insn_str}** | **{tot_cpu_str}** |")
     lines.append("")
 
     with open(path, "a") as f:
@@ -476,6 +619,24 @@ totals: 987654321
             raise AssertionError(f"parse_pin_count must reject {bad!r}")
     assert not pin_usable("", "")
     assert not pin_usable("/nonexistent/pin", "/nonexistent/tool.so")
+
+    # Alloc-shim totals: last valid marker wins, malformed marker
+    # lines are skipped (stderr is shared with the app).
+    assert parse_alloc_total("hi\nsnip_alloc_total_bytes=123\n") == 123
+    assert parse_alloc_total(
+        "snip_alloc_total_bytes=1\nsnip_alloc_total_bytes=42\n") == 42
+    assert parse_alloc_total(
+        "snip_alloc_total_bytes=oops\nsnip_alloc_total_bytes=7\n") == 7
+    for bad in ("", "no marker here\n", "snip_alloc_total_bytes=\n",
+                "snip_alloc_total_bytes=-1\n", "snip_alloc_total_bytes=1.5\n",
+                "snip_alloc_total_bytes=oops\n"):
+        try:
+            parse_alloc_total(bad)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"parse_alloc_total must reject {bad!r}")
+
     assert is_pin_timeout("TIMEOUT (>900s)")
     for other in ("", "exit 1: boom", "pin output unreadable: x",
                   "pin count unreadable: x"):
@@ -538,6 +699,75 @@ totals: 987654321
     assert "instructions" not in bmf_pin["math/gcd"]
     assert bmf_pin["math/gcd"]["pin_instructions"]["value"] == 9000
 
+    # Pin-only shape (--repeat 0): no timed phase, so no cpu_time
+    # row at all (never a zero one); allocated_bytes sits next to
+    # pin_instructions; an all-skipped snippet stays out of BMF.
+    pin_only_nocpu = [
+        {
+            "label": "math/gcd",
+            "case": "tc0",
+            "summary": {
+                "instructions": None,
+                "pin_instructions": {"median": 9000},
+                "allocated_bytes": {"median": 4096},
+                "cpu_s": None,
+                "runs": 0,
+            },
+        },
+    ]
+    bmf_nocpu = build_bmf(pin_only_nocpu)
+    assert "cpu_time" not in bmf_nocpu["math/gcd"]
+    assert "instructions" not in bmf_nocpu["math/gcd"]
+    assert bmf_nocpu["math/gcd"]["pin_instructions"]["value"] == 9000
+    assert bmf_nocpu["math/gcd"]["allocated_bytes"]["value"] == 4096
+    assert build_bmf([
+        {"label": "math/gcd", "case": "tc0",
+         "summary": {"instructions": None, "cpu_s": None, "runs": 0}},
+    ]) == {}
+
+    # Summary render: pin-only rows show "-" for CPU and the
+    # Allocated column; timed rows still show the cpu value.
+    fd_temp, tmppath = tempfile.mkstemp(prefix="snip-sum-", suffix=".md")
+    os.close(fd_temp)
+    try:
+        append_summary(tmppath, {"results": pin_only_nocpu}, bmf_nocpu)
+        with open(tmppath) as fd:
+            pin_text = fd.read()
+    finally:
+        os.unlink(tmppath)
+    assert "Allocated (B)" in pin_text
+    assert "| `math/gcd` | 1 | 9,000 | 4,096 | - | - |" in pin_text, pin_text
+    fd_temp, tmppath = tempfile.mkstemp(prefix="snip-sum-", suffix=".md")
+    os.close(fd_temp)
+    try:
+        append_summary(tmppath, {"results": mock_results}, bmf)
+        with open(tmppath) as fd:
+            timed_text = fd.read()
+    finally:
+        os.unlink(tmppath)
+    assert "| `sort/merge_sort` | 2 | 12,000 | - | 3,000 | 0.1000 |" in timed_text, timed_text
+
+    # Alloc-shim build + smoke (Linux only: LD_PRELOAD interposition
+    # has no macOS equivalent).
+    if sys.platform.startswith("linux"):
+        shim = ensure_alloc_shim()
+        assert os.path.isfile(shim), shim
+        env = dict(os.environ)
+        prev = env.get("LD_PRELOAD")
+        env["LD_PRELOAD"] = shim if not prev else shim + ":" + prev
+        proc = subprocess.run(
+            [sys.executable, "-c", "print('hi')"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=60,
+            env=env,
+        )
+        assert proc.returncode == 0, proc.stderr.decode(errors="ignore")
+        total = parse_alloc_total(proc.stderr.decode(errors="ignore"))
+        assert total > 0, total
+    else:
+        print("(skipping alloc-shim build test: needs Linux)")
+
     print("self-test passed!")
     return 0
 
@@ -569,6 +799,8 @@ def main(argv=None):
         parser.error("--pin-repeat must be >= 1")
     if args.pin_timeout < 1:
         parser.error("--pin-timeout must be >= 1")
+    if args.repeat < 0:
+        parser.error("--repeat must be >= 0")
 
     if args.self_test:
         return self_test()
@@ -587,14 +819,23 @@ def main(argv=None):
         return 0
 
     has_valgrind = shutil.which("valgrind") is not None
-    if not has_valgrind:
+    if not has_valgrind and args.repeat > 0:
         print("warning: valgrind not found in PATH; running Python directly without Callgrind simulation", file=sys.stderr)
 
     use_pin = args.pin and pin_usable(args.pin_bin, args.pin_tool)
     if args.pin and not use_pin:
         print("warning: pin unavailable (need --pin-bin launcher and --pin-tool inscount .so); pin_instructions will be null", file=sys.stderr)
+    if args.repeat == 0 and not use_pin:
+        parser.error("--repeat 0 skips the timed phase, so it needs --pin (pin-only mode)")
     pin_ver = pin_version(args.pin_bin) if use_pin else None
     effective_pin_repeat = args.pin_repeat if use_pin else 0
+
+    alloc_shim = None
+    if use_pin:
+        try:
+            alloc_shim = ensure_alloc_shim()
+        except RuntimeError as exc:
+            print("warning: alloc shim unavailable ({}); allocated_bytes will be null".format(exc), file=sys.stderr)
 
     tasks = []
     missing = []
@@ -642,6 +883,7 @@ def main(argv=None):
                 args.pin_tool,
                 effective_pin_repeat,
                 args.pin_timeout,
+                alloc_shim,
             ): (label, stem, script, case_name)
             for label, stem, script, case_name, inp, outp in tasks
         }
@@ -654,6 +896,9 @@ def main(argv=None):
                 if summary.get("pin_instructions"):
                     pin_med = summary["pin_instructions"]["median"]
                     parts.append(f"{int(pin_med):,} Pin")
+                    if summary.get("allocated_bytes"):
+                        alloc_med = summary["allocated_bytes"]["median"]
+                        parts.append(f"{int(alloc_med):,}B alloc")
                 elif pin_skipped:
                     parts.append(f"pin skipped: {pin_skipped}")
                 insn = summary["instructions"]["median"] if summary.get("instructions") else None
@@ -680,6 +925,7 @@ def main(argv=None):
         "has_valgrind": has_valgrind,
         "pin_used": use_pin,
         "pin_version": pin_ver,
+        "alloc_shim_used": alloc_shim is not None,
         "results": results,
         "failures": failures,
     }
