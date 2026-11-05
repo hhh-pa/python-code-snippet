@@ -51,18 +51,22 @@ tools/build_bundle.sh <resource/shared dir> [passphrase-file]
 
 See `tools/build_bundle.sh` for rotation instructions when using a fresh passphrase.
 
-## Performance Tracking (Callgrind)
+## Performance Tracking (Intel Pin)
 
-`tools/measure.py` measures load-independent algorithmic complexity using Valgrind Callgrind:
+`tools/measure.py` measures load-independent algorithmic complexity using Intel Pin with the vendored inscount tool (`scripts/ci/instrumentation/`):
 
-- `instructions` (`Ir` — simulated instruction reads) — completely load-invariant and deterministic across runs and runners.
+- `pin_instructions` (executed application instructions under Pin 4.4) — completely load-invariant and deterministic across runs and runners.
 - `cpu_time` (user + sys CPU time)
 - `wall_time`
 
+When Valgrind happens to be installed locally, a Callgrind `instructions` (`Ir`) signal is recorded too; CI no longer installs Valgrind, so that measure is absent there.
+
 ```sh
+bash scripts/ci/setup-instrumentation.sh  # one-time: fetch Pin 4.4 kit, build tool
 python3 tools/measure.py --resources tests/resources --repeat 1 \
+  --pin --pin-bin "$INSTRUMENTATION_BIN" --pin-tool "$INSTRUMENTATION_TOOL" \
   --output perf.json --bmf-output bencher.json
 python3 tools/measure.py --self-test
 ```
 
-CI runs correctness across sharded runners in the `test-shard` jobs, aggregated by `test`. Then the `perf-instrumentation` job measures instruction counts under Valgrind Callgrind across 4 shards, reporting to Bencher under testbed `ubuntu-latest-python` and measure `instructions` (gated by `BENCHER_API_KEY`). A fan-in `report-instrumentation` job merges all shard results, verifies equality against the plain BMF union (`jq -s 'add'`), and publishes a combined Markdown summary table to the GitHub Actions job summary.
+CI runs correctness across sharded runners in the `test-shard` jobs, aggregated by `test`. Then the `perf-instrumentation` job provisions the cached Pin 4.4 kit and measures instruction counts under Pin across 4 shards, reporting to Bencher under testbed `ubuntu-latest-python` and measure `pin_instructions` (gated by `BENCHER_API_KEY`). A fan-in `report-instrumentation` job merges all shard results, verifies equality against the plain BMF union (`jq -s 'add'`), and publishes a combined Markdown summary table to the GitHub Actions job summary.

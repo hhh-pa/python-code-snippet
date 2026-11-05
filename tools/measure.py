@@ -2,23 +2,25 @@
 """Load-independent performance measurement for Python snippets.
 
 Runs every src/**/*.py script against the shared test cases and records
-metrics under Valgrind Callgrind:
+metrics under Intel Pin (inscount tool):
 
-  * instructions (simulated instruction reads 'Ir' from Callgrind) --
+  * pin_instructions (executed application instructions under Pin) --
     fully load-independent and deterministic across runs.
   * cpu_s (user + sys CPU time).
   * wall_s (wall time).
   * maxrss_kb (peak RSS in KB).
 
-Plus (under the new flags) Pin instruction counts from an inscount
-tool run: pin_instructions min/median/max per case.
+Plus, when Valgrind is installed locally, Callgrind instruction reads
+('Ir') as instructions min/median/max per case. CI no longer installs
+Valgrind, so the Callgrind signal is absent there; the Callgrind code
+paths stay for local use.
 
 Usage:
     python3 tools/measure.py --resources tests/resources \
         [--repeat 1] [--jobs 2] [--timeout 300] [--only substring] \
         [--output perf.json] [--bmf-output bencher.json] \
         [--summary-file "$GITHUB_STEP_SUMMARY"] [--shard K/N] \
-        [--pin] [--pin-bin BIN] [--pin-tool SO] [--pin-repeat N] \
+        --pin --pin-bin BIN --pin-tool SO [--pin-repeat N] \
         [--pin-timeout S]
 
     python3 tools/measure.py --merge shard-*.json --output merged.json \
@@ -45,7 +47,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "tests"))
 import run_tests
 
-TOOL_VERSION = 2
+TOOL_VERSION = 3
 _CALLGRIND_TOTAL_RE = re.compile(r"^(?:totals|summary):\s*(\d+)", re.MULTILINE)
 
 # Pin inscount defaults: two counts per case catch instrument
@@ -318,7 +320,11 @@ def measure_case_pin(exec_cmd, label, case_name, input_path, output_path,
 
 def measure_case_full(has_valgrind, label, script, case_name, inp, outp,
                       repeat, timeout, pin_bin, pin_tool, pin_repeat, pin_timeout):
-    """Callgrind measure plus the optional Pin inscount phase.
+    """Direct/Callgrind measure plus the Pin inscount phase.
+
+    The first phase runs the case natively (or under Callgrind when
+    valgrind is installed) for correctness and wall/cpu time; the Pin
+    phase provides the deterministic instruction count.
 
     Returns (summary|None, pin_skipped|None, error|None).
     """
@@ -348,6 +354,8 @@ def build_bmf(results):
         items = snippets[name]
         total_instructions = 0
         has_instructions = False
+        total_pin = 0
+        has_pin = False
         total_cpu = 0.0
 
         for it in items:
@@ -357,12 +365,17 @@ def build_bmf(results):
             if s.get("instructions") and s["instructions"]["median"] is not None:
                 total_instructions += int(s["instructions"]["median"])
                 has_instructions = True
+            if s.get("pin_instructions") and s["pin_instructions"]["median"] is not None:
+                total_pin += int(s["pin_instructions"]["median"])
+                has_pin = True
             if s.get("cpu_s") and s["cpu_s"]["median"] is not None:
                 total_cpu += float(s["cpu_s"]["median"])
 
         measures = {}
         if has_instructions:
             measures["instructions"] = {"value": total_instructions}
+        if has_pin:
+            measures["pin_instructions"] = {"value": total_pin}
         measures["cpu_time"] = {"value": total_cpu}
 
         bmf[name] = measures
@@ -398,15 +411,17 @@ def append_summary(path, report, bmf):
     if not path:
         return
     lines = [
-        "### Callgrind Performance Summary (Python)",
+        "### Instrumentation Performance Summary (Python)",
         "",
-        "| Benchmark | Cases | Instructions (Ir) | CPU Time (s) |",
-        "| :--- | :---: | :---: | :---: |",
+        "| Benchmark | Cases | Pin Instr | Callgrind Ir | CPU Time (s) |",
+        "| :--- | :---: | :---: | :---: | :---: |",
     ]
 
     total_insn = 0
+    total_pin = 0
     total_cpu = 0.0
     has_insn = False
+    has_pin = False
 
     snippets = {}
     for r in report.get("results", []):
@@ -415,6 +430,12 @@ def append_summary(path, report, bmf):
     for name in sorted(snippets):
         cases_count = len(snippets[name])
         m = bmf.get(name, {})
+        pin_str = "-"
+        if "pin_instructions" in m:
+            val = m["pin_instructions"]["value"]
+            pin_str = f"{val:,}"
+            total_pin += val
+            has_pin = True
         insn_str = "-"
         if "instructions" in m:
             val = m["instructions"]["value"]
@@ -423,10 +444,11 @@ def append_summary(path, report, bmf):
             has_insn = True
         cpu_val = m.get("cpu_time", {}).get("value", 0.0)
         total_cpu += cpu_val
-        lines.append(f"| `{name}` | {cases_count} | {insn_str} | {cpu_val:.4f} |")
+        lines.append(f"| `{name}` | {cases_count} | {pin_str} | {insn_str} | {cpu_val:.4f} |")
 
+    tot_pin_str = f"{total_pin:,}" if has_pin else "-"
     tot_insn_str = f"{total_insn:,}" if has_insn else "-"
-    lines.append(f"| **Total ({len(snippets)} snippets)** | - | **{tot_insn_str}** | **{total_cpu:.4f}** |")
+    lines.append(f"| **Total ({len(snippets)} snippets)** | - | **{tot_pin_str}** | **{tot_insn_str}** | **{total_cpu:.4f}** |")
     lines.append("")
 
     with open(path, "a") as f:
@@ -480,6 +502,7 @@ totals: 987654321
             "case": "tc0",
             "summary": {
                 "instructions": {"median": 1000},
+                "pin_instructions": {"median": 4000},
                 "cpu_s": {"median": 0.05},
             },
         },
@@ -488,13 +511,32 @@ totals: 987654321
             "case": "tc1",
             "summary": {
                 "instructions": {"median": 2000},
+                "pin_instructions": {"median": 8000},
                 "cpu_s": {"median": 0.05},
             },
         },
     ]
     bmf = build_bmf(mock_results)
     assert bmf["sort/merge_sort"]["instructions"]["value"] == 3000
+    assert bmf["sort/merge_sort"]["pin_instructions"]["value"] == 12000
     assert abs(bmf["sort/merge_sort"]["cpu_time"]["value"] - 0.10) < 1e-6
+
+    # Pin BMF without any Callgrind signal (the CI shape: no
+    # valgrind installed, so no "instructions" measure at all).
+    pin_only = [
+        {
+            "label": "math/gcd",
+            "case": "tc0",
+            "summary": {
+                "instructions": None,
+                "pin_instructions": {"median": 9000},
+                "cpu_s": {"median": 0.02},
+            },
+        },
+    ]
+    bmf_pin = build_bmf(pin_only)
+    assert "instructions" not in bmf_pin["math/gcd"]
+    assert bmf_pin["math/gcd"]["pin_instructions"]["value"] == 9000
 
     print("self-test passed!")
     return 0
@@ -514,7 +556,7 @@ def main(argv=None):
     parser.add_argument("--merge", nargs="*", default=None, help="merge shard JSON files")
     parser.add_argument("--self-test", action="store_true", help="run self-test")
     parser.add_argument("--pin", action="store_true",
-                        help="also count instructions under Intel Pin")
+                        help="count instructions under Intel Pin (primary signal)")
     parser.add_argument("--pin-bin", default="",
                         help="Pin launcher binary (Intel kit, direct download)")
     parser.add_argument("--pin-tool", default="",
@@ -572,7 +614,13 @@ def main(argv=None):
         tasks = select_shard(tasks, index, total)
 
     total_tasks = len(tasks)
-    print(f"Measuring {total_tasks} cases ({len({t[0] for t in tasks})} benchmarks) with Callgrind...")
+    if use_pin:
+        backend = "Pin inscount"
+    elif has_valgrind:
+        backend = "Callgrind"
+    else:
+        backend = "direct run (no instrumentation)"
+    print(f"Measuring {total_tasks} cases ({len({t[0] for t in tasks})} benchmarks) with {backend}...")
 
     results = []
     failures = []
@@ -602,15 +650,15 @@ def main(argv=None):
             summary, pin_skipped, err = future.result()
             done += 1
             if err is None:
-                insn = summary["instructions"]["median"] if summary.get("instructions") else None
-                insn_s = f"{int(insn):,} Ir" if insn else "n/a"
-                pin_info = ""
+                parts = []
                 if summary.get("pin_instructions"):
                     pin_med = summary["pin_instructions"]["median"]
-                    pin_info = f"; {int(pin_med):,} Pin"
+                    parts.append(f"{int(pin_med):,} Pin")
                 elif pin_skipped:
-                    pin_info = f" (pin skipped: {pin_skipped})"
-                print(f"[{done}/{total_tasks}] {label}/{case_name}: {insn_s}{pin_info}")
+                    parts.append(f"pin skipped: {pin_skipped}")
+                insn = summary["instructions"]["median"] if summary.get("instructions") else None
+                parts.append(f"{int(insn):,} Ir" if insn else "n/a Ir")
+                print(f"[{done}/{total_tasks}] {label}/{case_name}: {'; '.join(parts)}")
                 entry = {
                     "label": label,
                     "stem": stem,
