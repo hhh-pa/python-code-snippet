@@ -105,15 +105,19 @@ jobs:
       - name: Provision instrumentation (Pin 4.4)
         run: bash scripts/ci/setup-instrumentation.sh
 
-      - name: Measure performance (Pin instructions)
-        # Pin budget 600/repeat: the heaviest cases (edit_distance)
-        # run minutes under instrumentation with --jobs 2; the
-        # native first phase stays on the same 600s ceiling. Pin
-        # timeouts degrade to pin-skipped (native data stays valid);
-        # genuine hangs still fail via the native phase.
+      - name: Measure performance (Pin-only sweep)
+        # Pin-only sweep: --repeat 0 skips the native timed phase, so
+        # each case is measured ONCE under Pin (inscount) with the
+        # LD_PRELOAD alloc shim in the same run; correctness gates on
+        # the instrumented run's stdout. Pin budget 600/repeat: the
+        # heaviest cases (edit_distance) run minutes under
+        # instrumentation with --jobs 2. Pin timeouts degrade to
+        # pin-skipped (skipped cases contribute no BMF rows in this
+        # mode); genuine hangs still fail in the test-shard jobs,
+        # which run natively with --timeout 300.
         run: |
           python3 tools/measure.py --resources tests/resources \
-            --repeat 1 --jobs 2 --timeout 600 \
+            --repeat 0 --jobs 2 \
             --pin --pin-bin "$INSTRUMENTATION_BIN" \
             --pin-tool "$INSTRUMENTATION_TOOL" \
             --pin-repeat 2 --pin-timeout 600 \

@@ -7,6 +7,8 @@
 # re-exports the paths. Otherwise it downloads the kit from
 # Intel, verifies its sha256, extracts it, and builds
 # scripts/ci/instrumentation/inscount.cpp against it.
+# tools/measure.py builds scripts/ci/instrumentation/allocshim.c on
+# demand with cc at sweep time (present on ubuntu-latest runners).
 #
 # Outputs (stdout for logs, $GITHUB_ENV when present):
 #   INSTRUMENTATION_BIN   absolute path to the pin launcher
@@ -35,6 +37,7 @@ if need_tool; then
   command -v g++ >/dev/null || { err "g++ is required to build the inscount tool"; exit 1; }
   command -v curl >/dev/null || { err "curl is required to fetch the Pin kit"; exit 1; }
   [ -f "$TOOL_SRC/inscount.cpp" ] || { err "tool sources missing at $TOOL_SRC"; exit 1; }
+  [ -f "$TOOL_SRC/allocshim.c" ] || { err "alloc-shim source missing at $TOOL_SRC"; exit 1; }
   mkdir -p "$INSTRUMENTATION_DIR"
   if [ ! -x "$INSTRUMENTATION_BIN" ]; then
     err "downloading Pin 4.4 kit..."
