@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Load-independent Callgrind performance measurement for Python snippets.
+"""Load-independent performance measurement for Python snippets.
 
 Runs every src/**/*.py script against the shared test cases and records
 metrics under Valgrind Callgrind:
@@ -10,11 +10,16 @@ metrics under Valgrind Callgrind:
   * wall_s (wall time).
   * maxrss_kb (peak RSS in KB).
 
+Plus (under the new flags) Pin instruction counts from an inscount
+tool run: pin_instructions min/median/max per case.
+
 Usage:
     python3 tools/measure.py --resources tests/resources \
         [--repeat 1] [--jobs 2] [--timeout 300] [--only substring] \
         [--output perf.json] [--bmf-output bencher.json] \
-        [--summary-file "$GITHUB_STEP_SUMMARY"] [--shard K/N]
+        [--summary-file "$GITHUB_STEP_SUMMARY"] [--shard K/N] \
+        [--pin] [--pin-bin BIN] [--pin-tool SO] [--pin-repeat N] \
+        [--pin-timeout S]
 
     python3 tools/measure.py --merge shard-*.json --output merged.json \
         [--bmf-output bencher.json] [--summary-file summary.md]
@@ -40,8 +45,14 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "tests"))
 import run_tests
 
-TOOL_VERSION = 1
+TOOL_VERSION = 2
 _CALLGRIND_TOTAL_RE = re.compile(r"^(?:totals|summary):\s*(\d+)", re.MULTILINE)
+
+# Pin inscount defaults: two counts per case catch instrument
+# flakiness without paying for more slow runs; the Pin budget is
+# separate from --timeout since instrumentation runs ~10-100x slower.
+PIN_REPEAT_DEFAULT = 2
+PIN_TIMEOUT_DEFAULT = 600
 
 
 def parse_callgrind_output(content):
@@ -60,6 +71,66 @@ def parse_callgrind_output(content):
                 except (ValueError, IndexError):
                     pass
     return None
+
+
+def parse_pin_count(content):
+    """Extract the total from inscount-style tool output (one "Count N" line).
+
+    Later Count lines win so per-thread dumps still resolve to their
+    trailing total. Raises ValueError when no Count line parses.
+    """
+    found = None
+    for line in content.splitlines():
+        fields = line.split()
+        if len(fields) != 2 or fields[0] != "Count":
+            continue
+        digits = fields[1]
+        if not digits or any(c not in "0123456789" for c in digits):
+            raise ValueError("pin count unreadable: {!r}".format(line.strip()))
+        found = int(digits)
+    if found is None:
+        raise ValueError("pin count unreadable: no Count line")
+    return found
+
+
+def pin_usable(pin_bin, tool):
+    """Whether Pin count runs can execute: launcher resolves, tool exists."""
+    if not pin_bin or not tool:
+        return False
+    if not os.path.isfile(tool):
+        return False
+    if os.path.dirname(pin_bin):
+        return os.path.isfile(pin_bin) and os.access(pin_bin, os.X_OK)
+    return shutil.which(pin_bin) is not None
+
+
+def pin_version(pin_bin):
+    """Probe `pin -version` for report provenance, or None when silent.
+
+    Compared runs must share one Pin version: counts are only
+    comparable within a version.
+    """
+    try:
+        proc = subprocess.run(
+            [pin_bin, "-version"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=30,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if proc.returncode != 0:
+        return None
+    for line in proc.stdout.decode(errors="ignore").splitlines():
+        if line.strip():
+            return line.strip()
+    return None
+
+
+def is_pin_timeout(run_err):
+    """Whether a Pin run error text is a deadline timeout (degrades to
+    a skip) rather than a crash (fails the case)."""
+    return "TIMEOUT" in run_err
 
 
 def parse_shard(text):
@@ -174,6 +245,97 @@ def measure_case_callgrind(has_valgrind, script, case_name, input_path, output_p
     return summary, None
 
 
+def pin_once(pin_bin, pin_tool, exec_cmd, input_bytes, timeout):
+    """Run exec_cmd once under Pin with the inscount tool.
+
+    Returns (stdout, count, run_err): run_err is "" on success, else a
+    short "TIMEOUT (>Ns)" / "exit N: ..." / "pin output unreadable"
+    text for the caller to classify.
+    """
+    fd_temp, out_file = tempfile.mkstemp(prefix="snip-pin-", suffix=".out")
+    os.close(fd_temp)
+    try:
+        cmd = [pin_bin, "-t", pin_tool, "-o", out_file, "--"] + list(exec_cmd)
+        try:
+            proc = subprocess.run(
+                cmd,
+                input=input_bytes,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=timeout,
+            )
+        except subprocess.TimeoutExpired:
+            return None, 0, "TIMEOUT (>{}s)".format(timeout)
+        if proc.returncode != 0:
+            err_text = proc.stderr.decode(errors="ignore").strip().splitlines()
+            return None, 0, "exit {}: {}".format(
+                proc.returncode, err_text[-1] if err_text else "no stderr")
+        try:
+            with open(out_file, "r", errors="ignore") as fd:
+                count = parse_pin_count(fd.read())
+        except (OSError, ValueError) as exc:
+            return None, 0, "pin output unreadable: {}".format(exc)
+        return proc.stdout, count, ""
+    finally:
+        if os.path.exists(out_file):
+            try:
+                os.unlink(out_file)
+            except OSError:
+                pass
+
+
+def measure_case_pin(exec_cmd, label, case_name, input_path, output_path,
+                     pin_bin, pin_tool, pin_repeat, pin_timeout):
+    """Pin inscount phase for one case.
+
+    Returns (pin_summary|None, pin_skipped|None, error|None): timeouts
+    degrade to pin_skipped (callgrind data stays valid), crashes and
+    output mismatches fail the case.
+    """
+    with open(output_path, "rb") as fd:
+        expected = run_tests.normalize(fd.read())
+    with open(input_path, "rb") as fd:
+        input_bytes = fd.read()
+
+    counts = []
+    for i in range(pin_repeat):
+        stdout, count, run_err = pin_once(
+            pin_bin, pin_tool, exec_cmd, input_bytes, pin_timeout)
+        if run_err:
+            if is_pin_timeout(run_err):
+                print("warning: {}/{}: pin skipped ({})".format(
+                    label, case_name, run_err), file=sys.stderr)
+                return None, run_err, None
+            return None, None, "pin: {}".format(run_err)
+        if i == 0 and run_tests.normalize(stdout) != expected:
+            got = run_tests.normalize(stdout).decode(errors="ignore")
+            want = expected.decode(errors="ignore")
+            return None, None, "pin output mismatch: expected {!r} got {!r}".format(
+                want[:100], got[:100])
+        counts.append(count)
+    return summarize_numbers(counts), None, None
+
+
+def measure_case_full(has_valgrind, label, script, case_name, inp, outp,
+                      repeat, timeout, pin_bin, pin_tool, pin_repeat, pin_timeout):
+    """Callgrind measure plus the optional Pin inscount phase.
+
+    Returns (summary|None, pin_skipped|None, error|None).
+    """
+    summary, err = measure_case_callgrind(
+        has_valgrind, script, case_name, inp, outp, repeat, timeout)
+    if err is not None or pin_repeat <= 0:
+        return summary, None, err
+    pin_summary, pin_skipped, pin_err = measure_case_pin(
+        [sys.executable, script], label, case_name, inp, outp,
+        pin_bin, pin_tool, pin_repeat, pin_timeout)
+    if pin_err is not None:
+        return None, None, pin_err
+    if pin_summary is not None:
+        summary["pin_instructions"] = pin_summary
+    return summary, pin_skipped, None
+
+
 def build_bmf(results):
     """Aggregate per-snippet summaries into Bencher Metric Format JSON."""
     snippets = {}
@@ -281,6 +443,22 @@ totals: 987654321
     parsed = parse_callgrind_output(sample_cg)
     assert parsed == 987654321, f"Expected 987654321, got {parsed}"
 
+    assert parse_pin_count("Count 846018869\n") == 846018869
+    assert parse_pin_count("Pin 3.31\nCount 1\nCount 42\n") == 42
+    for bad in ("", "no counts here\n", "Count abc\n", "Count\n", "Count 1 2\n"):
+        try:
+            parse_pin_count(bad)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"parse_pin_count must reject {bad!r}")
+    assert not pin_usable("", "")
+    assert not pin_usable("/nonexistent/pin", "/nonexistent/tool.so")
+    assert is_pin_timeout("TIMEOUT (>900s)")
+    for other in ("", "exit 1: boom", "pin output unreadable: x",
+                  "pin count unreadable: x"):
+        assert not is_pin_timeout(other), other
+
     sample_tasks = [
         ("sort/merge_sort", "solution", "s1", "tc0", "in", "out"),
         ("sort/merge_sort", "solution", "s1", "tc1", "in", "out"),
@@ -335,7 +513,20 @@ def main(argv=None):
     parser.add_argument("--summary-file", default=None, help="Markdown summary output")
     parser.add_argument("--merge", nargs="*", default=None, help="merge shard JSON files")
     parser.add_argument("--self-test", action="store_true", help="run self-test")
+    parser.add_argument("--pin", action="store_true",
+                        help="also count instructions under Intel Pin")
+    parser.add_argument("--pin-bin", default="",
+                        help="Pin launcher binary (Intel kit, direct download)")
+    parser.add_argument("--pin-tool", default="",
+                        help="inscount tool .so for Pin (-t)")
+    parser.add_argument("--pin-repeat", type=int, default=PIN_REPEAT_DEFAULT)
+    parser.add_argument("--pin-timeout", type=int, default=PIN_TIMEOUT_DEFAULT)
     args = parser.parse_args(argv)
+
+    if args.pin_repeat < 1:
+        parser.error("--pin-repeat must be >= 1")
+    if args.pin_timeout < 1:
+        parser.error("--pin-timeout must be >= 1")
 
     if args.self_test:
         return self_test()
@@ -356,6 +547,12 @@ def main(argv=None):
     has_valgrind = shutil.which("valgrind") is not None
     if not has_valgrind:
         print("warning: valgrind not found in PATH; running Python directly without Callgrind simulation", file=sys.stderr)
+
+    use_pin = args.pin and pin_usable(args.pin_bin, args.pin_tool)
+    if args.pin and not use_pin:
+        print("warning: pin unavailable (need --pin-bin launcher and --pin-tool inscount .so); pin_instructions will be null", file=sys.stderr)
+    pin_ver = pin_version(args.pin_bin) if use_pin else None
+    effective_pin_repeat = args.pin_repeat if use_pin else 0
 
     tasks = []
     missing = []
@@ -384,32 +581,46 @@ def main(argv=None):
     with ThreadPoolExecutor(max_workers=args.jobs) as pool:
         futures = {
             pool.submit(
-                measure_case_callgrind,
+                measure_case_full,
                 has_valgrind,
+                label,
                 script,
                 case_name,
                 inp,
                 outp,
                 args.repeat,
                 args.timeout,
+                args.pin_bin,
+                args.pin_tool,
+                effective_pin_repeat,
+                args.pin_timeout,
             ): (label, stem, script, case_name)
             for label, stem, script, case_name, inp, outp in tasks
         }
         for future in as_completed(futures):
             label, stem, script, case_name = futures[future]
-            summary, err = future.result()
+            summary, pin_skipped, err = future.result()
             done += 1
             if err is None:
                 insn = summary["instructions"]["median"] if summary.get("instructions") else None
                 insn_s = f"{int(insn):,} Ir" if insn else "n/a"
-                print(f"[{done}/{total_tasks}] {label}/{case_name}: {insn_s}")
-                results.append({
+                pin_info = ""
+                if summary.get("pin_instructions"):
+                    pin_med = summary["pin_instructions"]["median"]
+                    pin_info = f"; {int(pin_med):,} Pin"
+                elif pin_skipped:
+                    pin_info = f" (pin skipped: {pin_skipped})"
+                print(f"[{done}/{total_tasks}] {label}/{case_name}: {insn_s}{pin_info}")
+                entry = {
                     "label": label,
                     "stem": stem,
                     "case": case_name,
                     "script": os.path.relpath(script, ROOT),
                     "summary": summary,
-                })
+                }
+                if pin_skipped:
+                    entry["pin_skipped"] = pin_skipped
+                results.append(entry)
             else:
                 print(f"[{done}/{total_tasks}] FAIL {label}/{case_name}: {err}")
                 failures.append(f"{label}/{case_name}: {err}")
@@ -419,6 +630,8 @@ def main(argv=None):
         "platform": platform.platform(),
         "date": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "has_valgrind": has_valgrind,
+        "pin_used": use_pin,
+        "pin_version": pin_ver,
         "results": results,
         "failures": failures,
     }
