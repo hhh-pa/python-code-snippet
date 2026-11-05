@@ -31,7 +31,12 @@ Usage:
         [--output perf.json] [--bmf-output bencher.json] \
         [--summary-file "$GITHUB_STEP_SUMMARY"] [--shard K/N] \
         --pin --pin-bin BIN --pin-tool SO [--pin-repeat N] \
-        [--pin-timeout S]
+        [--pin-timeout S] [--time-bin BIN] [--label-style python|snip]
+
+Timed repeats run under GNU time (required when --repeat > 0) for
+real cpu_s/maxrss_kb. --label-style snip renders area/problem
+labels so head-to-head runs key identically to
+clojure-code-snippet.
 
     python3 tools/measure.py --merge shard-*.json --output merged.json \
         [--bmf-output bencher.json] [--summary-file summary.md]
@@ -145,6 +150,69 @@ def pin_version(pin_bin):
     return None
 
 
+def resolve_time_bin(explicit):
+    """Resolve a GNU time binary, or None when unusable.
+
+    Prefers the explicit path, else "time" from PATH. Rejects BSD
+    time (macOS): only GNU time supports -f/-o. Returns the binary
+    path, or None with no side effects.
+    """
+    candidates = [explicit] if explicit else []
+    found = shutil.which("time")
+    if found and found not in candidates:
+        candidates.append(found)
+    for cand in candidates:
+        try:
+            proc = subprocess.run(
+                [cand, "--version"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=30,
+            )
+        except (OSError, subprocess.SubprocessError):
+            continue
+        out = (proc.stdout + proc.stderr).decode(errors="ignore")
+        if proc.returncode == 0 and "GNU" in out:
+            return cand
+    return None
+
+
+def parse_time_output(content):
+    """Parse GNU time -f "%U %S %M" output.
+
+    Returns (cpu_seconds, maxrss_kb): user+sys CPU time and peak
+    resident set. Raises ValueError when the line is missing or
+    malformed.
+    """
+    for line in content.splitlines():
+        fields = line.split()
+        if len(fields) != 3:
+            continue
+        try:
+            cpu = float(fields[0]) + float(fields[1])
+            rss = int(fields[2])
+        except ValueError:
+            continue
+        return cpu, rss
+    raise ValueError("time output unreadable: no '%U %S %M' line")
+
+
+def case_label(area, problem, stem, style):
+    """Render a case label for a suite's key convention.
+
+    "python" keeps this repo's labels ("area/problem/stem" unless
+    the stem repeats the problem); "snip" renders area/problem so
+    head-to-head runs key identically to clojure-code-snippet
+    (whose stem travels separately), making instruction and RSS
+    medians directly comparable case by case.
+    """
+    if style == "snip":
+        return "{}/{}".format(area, problem)
+    if problem != stem:
+        return "{}/{}/{}".format(area, problem, stem)
+    return "{}/{}".format(area, problem)
+
+
 def parse_alloc_total(content):
     """Extract the alloc shim's total from child stderr text.
 
@@ -243,19 +311,20 @@ def summarize_numbers(values):
     }
 
 
-def measure_case_callgrind(has_valgrind, script, case_name, input_path, output_path, repeat, timeout):
+def measure_case_callgrind(has_valgrind, time_bin, script, case_name, input_path, output_path, repeat, timeout):
     with open(output_path, "rb") as fd:
         expected = run_tests.normalize(fd.read())
 
     runs = []
     for _ in range(repeat):
         callgrind_file = None
+        time_file = None
         fd_temp = None
         try:
             if has_valgrind:
                 fd_temp, callgrind_file = tempfile.mkstemp(prefix="snip-cg-", suffix=".out")
                 os.close(fd_temp)
-                cmd = [
+                inner = [
                     "valgrind",
                     "--tool=callgrind",
                     f"--callgrind-out-file={callgrind_file}",
@@ -263,7 +332,10 @@ def measure_case_callgrind(has_valgrind, script, case_name, input_path, output_p
                     script,
                 ]
             else:
-                cmd = [sys.executable, script]
+                inner = [sys.executable, script]
+            fd_temp, time_file = tempfile.mkstemp(prefix="snip-time-", suffix=".out")
+            os.close(fd_temp)
+            cmd = [time_bin, "-f", "%U %S %M", "-o", time_file] + inner
 
             t0 = time.perf_counter()
             with open(input_path, "rb") as stdin_fd:
@@ -292,19 +364,25 @@ def measure_case_callgrind(has_valgrind, script, case_name, input_path, output_p
             if has_valgrind and callgrind_file and os.path.isfile(callgrind_file):
                 with open(callgrind_file, "r", errors="ignore") as cg_fd:
                     instructions = parse_callgrind_output(cg_fd.read())
+            try:
+                with open(time_file, "r", errors="ignore") as tm_fd:
+                    cpu_s, maxrss_kb = parse_time_output(tm_fd.read())
+            except (OSError, ValueError) as exc:
+                return None, "time output unreadable: {}".format(exc)
 
             runs.append({
                 "instructions": instructions,
                 "wall_s": wall_s,
-                "cpu_s": wall_s,  # fallback approximation
-                "maxrss_kb": 0,
+                "cpu_s": cpu_s,
+                "maxrss_kb": maxrss_kb,
             })
         finally:
-            if callgrind_file and os.path.exists(callgrind_file):
-                try:
-                    os.unlink(callgrind_file)
-                except OSError:
-                    pass
+            for path in (callgrind_file, time_file):
+                if path and os.path.exists(path):
+                    try:
+                        os.unlink(path)
+                    except OSError:
+                        pass
 
     # Summarize runs
     insn_vals = [r["instructions"] for r in runs if r["instructions"] is not None]
@@ -336,6 +414,10 @@ def pin_once(pin_bin, pin_tool, exec_cmd, input_bytes, timeout, alloc_shim=None)
     os.close(fd_temp)
     try:
         cmd = [pin_bin, "-t", pin_tool, "-o", out_file, "--"] + list(exec_cmd)
+        if sys.platform.startswith("linux") and shutil.which("setarch"):
+            # Fixed address layout: keeps CPython's mmaps clear of
+            # Pin's reserved region under ASLR, mirroring the JVM legs.
+            cmd = ["setarch", "-R"] + cmd
         env = None
         if alloc_shim:
             env = dict(os.environ)
@@ -417,7 +499,7 @@ def measure_case_pin(exec_cmd, label, case_name, input_path, output_path,
     return signals, None, None
 
 
-def measure_case_full(has_valgrind, label, script, case_name, inp, outp,
+def measure_case_full(has_valgrind, time_bin, label, script, case_name, inp, outp,
                       repeat, timeout, pin_bin, pin_tool, pin_repeat, pin_timeout,
                       alloc_shim=None):
     """Direct/Callgrind measure plus the Pin inscount phase.
@@ -433,7 +515,7 @@ def measure_case_full(has_valgrind, label, script, case_name, inp, outp,
     """
     if repeat > 0:
         summary, err = measure_case_callgrind(
-            has_valgrind, script, case_name, inp, outp, repeat, timeout)
+            has_valgrind, time_bin, script, case_name, inp, outp, repeat, timeout)
         if err is not None or pin_repeat <= 0:
             return summary, None, err
     else:
@@ -620,6 +702,21 @@ totals: 987654321
     assert not pin_usable("", "")
     assert not pin_usable("/nonexistent/pin", "/nonexistent/tool.so")
 
+    assert parse_time_output("0.12 0.03 15236\n") == (0.15, 15236)
+    assert parse_time_output("noise\n1.00 0.00 8192\n") == (1.0, 8192)
+    for bad in ("", "no numbers here\n", "0.1 0.2\n", "a b c\n", "1 2 3 4\n"):
+        try:
+            parse_time_output(bad)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("parse_time_output must reject {!r}".format(bad))
+
+    assert case_label("sort", "bubble_sort", "solution", "python") == "sort/bubble_sort/solution"
+    assert case_label("sort", "bubble_sort", "solution", "snip") == "sort/bubble_sort"
+    assert case_label("math", "gcd", "gcd", "python") == "math/gcd"
+    assert case_label("math", "gcd", "gcd", "snip") == "math/gcd"
+
     # Alloc-shim totals: last valid marker wins, malformed marker
     # lines are skipped (stderr is shared with the app).
     assert parse_alloc_total("hi\nsnip_alloc_total_bytes=123\n") == 123
@@ -793,6 +890,10 @@ def main(argv=None):
                         help="inscount tool .so for Pin (-t)")
     parser.add_argument("--pin-repeat", type=int, default=PIN_REPEAT_DEFAULT)
     parser.add_argument("--pin-timeout", type=int, default=PIN_TIMEOUT_DEFAULT)
+    parser.add_argument("--time-bin", default="",
+                        help="GNU time binary for the timed phase (default: auto)")
+    parser.add_argument("--label-style", default="python", choices=("python", "snip"),
+                        help="snip renders area/problem labels for h2h key alignment")
     args = parser.parse_args(argv)
 
     if args.pin_repeat < 1:
@@ -821,6 +922,9 @@ def main(argv=None):
     has_valgrind = shutil.which("valgrind") is not None
     if not has_valgrind and args.repeat > 0:
         print("warning: valgrind not found in PATH; running Python directly without Callgrind simulation", file=sys.stderr)
+    time_bin = resolve_time_bin(args.time_bin)
+    if args.repeat > 0 and time_bin is None:
+        parser.error("need GNU time for the timed phase (cpu_s/maxrss_kb); install time or pass --time-bin")
 
     use_pin = args.pin and pin_usable(args.pin_bin, args.pin_tool)
     if args.pin and not use_pin:
@@ -840,7 +944,7 @@ def main(argv=None):
     tasks = []
     missing = []
     for area, problem, stem, script, cases in run_tests.discover(args.resources):
-        label = f"{area}/{problem}/{stem}" if problem != stem else f"{area}/{problem}"
+        label = case_label(area, problem, stem, args.label_style)
         if args.only and args.only not in label and args.only not in script:
             continue
         if not cases:
@@ -872,6 +976,7 @@ def main(argv=None):
             pool.submit(
                 measure_case_full,
                 has_valgrind,
+                time_bin,
                 label,
                 script,
                 case_name,
@@ -909,6 +1014,7 @@ def main(argv=None):
                     "stem": stem,
                     "case": case_name,
                     "script": os.path.relpath(script, ROOT),
+                    "ok": True,
                     "summary": summary,
                 }
                 if pin_skipped:
