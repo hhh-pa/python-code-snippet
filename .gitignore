@@ -5,3 +5,7 @@ __pycache__/
 tests/resources/
 perf-results*.json
 bencher-bmf*.json
+sweep-results*.json
+sweep-bmf*.json
+sweep-compare.json
+sweep-refs.json
