@@ -12,8 +12,9 @@
 // destructor (if any) are missed identically every run, so they
 // shift the total by a constant, never by noise.
 //
-// tools/measure.py builds this file on demand (cc -shared -fPIC)
-// and preloads it in the SAME Pin run as the inscount tool
+// snip measure builds this file on demand (cc -shared -fPIC,
+// EnsureAllocShim) and preloads it in the SAME Pin run as the
+// inscount tool
 // (LD_PRELOAD shim + pin -t inscount -- python ...), so each
 // instrumented run yields both pin_instructions and
 // allocated_bytes. The total therefore includes Pin's own

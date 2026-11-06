@@ -237,3 +237,22 @@ func TestSnipTestMissingShardScoped(t *testing.T) {
 		}
 	}
 }
+
+func TestSnipJobsValidation(t *testing.T) {
+	bin := cmdtest.Build(t, ".")
+	dir := t.TempDir()
+	// --jobs 0 hung forever (unbuffered semaphore) and --jobs -1
+	// panicked (makechan); both must now fail fast with exit 2.
+	for _, sub := range []string{"test", "measure"} {
+		for _, jobs := range []string{"0", "-1"} {
+			_, stderr, code := cmdtest.RunBothEnv(t, bin, dir, nil, sub,
+				"--jobs", jobs)
+			if code != 2 {
+				t.Fatalf("%s --jobs %s: exit = %d, want 2", sub, jobs, code)
+			}
+			if !strings.Contains(stderr, "--jobs must be >= 1") {
+				t.Fatalf("%s --jobs %s lacks loud failure:\n%s", sub, jobs, stderr)
+			}
+		}
+	}
+}

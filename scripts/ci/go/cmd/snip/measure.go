@@ -132,6 +132,10 @@ func runMeasure(argv []string) int {
 		return 2
 	}
 
+	if jobs < 1 {
+		fmt.Fprintln(os.Stderr, "snip measure: --jobs must be >= 1")
+		return 2
+	}
 	if repeat < 0 {
 		fmt.Fprintln(os.Stderr, "snip measure: --repeat must be >= 0")
 		return 2

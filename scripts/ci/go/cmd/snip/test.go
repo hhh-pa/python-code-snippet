@@ -92,6 +92,10 @@ func runTest(argv []string) int {
 		fmt.Fprintln(os.Stderr, err)
 		return 2
 	}
+	if jobs < 1 {
+		fmt.Fprintln(os.Stderr, "snip test: --jobs must be >= 1")
+		return 2
+	}
 
 	shardIndex, shardTotal := 0, 1
 	if shard != "" {
