@@ -1,3 +1,4 @@
+# https://www.hackerrank.com/challenges/kmp-fp/problem
 import sys
 
 def z_function(text, pattern):

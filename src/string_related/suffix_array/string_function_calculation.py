@@ -1,3 +1,4 @@
+# https://www.hackerrank.com/challenges/string-function-calculation
 import sys
 
 def cal_suffix_array(t):

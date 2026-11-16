@@ -1,3 +1,4 @@
+# https://www.hackerrank.com/challenges/count-strings
 import sys
 
 MOD = 1000000007

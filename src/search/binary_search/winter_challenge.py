@@ -1,3 +1,4 @@
+# https://www.hackerrank.com/contests/launchpad-1-winter-challenge/challenges/binary-search-advanced
 import sys
 import bisect
 

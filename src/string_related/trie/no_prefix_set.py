@@ -1,3 +1,4 @@
+# https://www.hackerrank.com/challenges/no-prefix-set/problem
 import sys
 
 class Trie:

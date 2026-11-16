@@ -1,3 +1,4 @@
+# https://www.hackerrank.com/challenges/sudoku/problem
 import sys
 
 def box_id(r, c):
