@@ -1,3 +1,4 @@
+# https://www.hackerrank.com/challenges/sherlock-and-anagrams/problem
 import sys
 from collections import Counter
 

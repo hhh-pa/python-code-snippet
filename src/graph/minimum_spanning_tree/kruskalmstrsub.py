@@ -1,3 +1,4 @@
+# https://www.hackerrank.com/challenges/kruskalmstrsub/problem
 import sys
 
 def main():

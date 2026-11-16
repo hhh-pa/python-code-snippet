@@ -1,3 +1,4 @@
+# https://www.hackerrank.com/challenges/longest-increasing-subsequent/problem
 import bisect
 import sys
 

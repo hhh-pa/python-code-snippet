@@ -1,3 +1,4 @@
+# https://www.hackerrank.com/contests/lab-assignment-2/challenges/making-make
 import sys
 import heapq
 
