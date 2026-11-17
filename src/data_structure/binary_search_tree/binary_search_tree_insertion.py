@@ -33,12 +33,12 @@ def main():
         return
     n = data[0]
     root = None
-    for v in data[1:1 + n]:
+    for v in data[1 : 1 + n]:
         root = insert(root, v)
     out = []
     preorder(root, out)
-    sys.stdout.write(' '.join(out) + ' ' if out else '')
+    sys.stdout.write(" ".join(out) + " " if out else "")
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
