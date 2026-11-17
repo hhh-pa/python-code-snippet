@@ -1,3 +1,4 @@
+# https://www.hackerearth.com/practice/algorithms/graphs/strongly-connected-components/tutorial/
 import sys
 from collections import Counter
 
