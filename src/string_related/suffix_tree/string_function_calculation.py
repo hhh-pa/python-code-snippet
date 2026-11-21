@@ -1,5 +1,6 @@
 """String function calculation with a suffix tree.
 
+HackerRank: https://www.hackerrank.com/challenges/string-function-calculation/problem
 Max over all distinct substrings of length times occurrences.
 Input: a single lowercase string token. Output: the maximum.
 
@@ -13,7 +14,7 @@ import sys
 
 
 class _Node:
-    __slots__ = ("link", "start", "end", "leaf", "next")
+    __slots__ = ("end", "leaf", "link", "next", "start")
 
     def __init__(self, start, end, leaf):
         self.link = 0
@@ -122,7 +123,7 @@ def string_value(s):
     n = len(s)
     if n == 0:
         return 0
-    return _tree_value(_build_tree(list(s) + ["$"]), n)
+    return _tree_value(_build_tree([*list(s), "$"]), n)
 
 
 def main():
