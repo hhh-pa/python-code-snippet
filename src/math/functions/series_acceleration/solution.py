@@ -1,5 +1,5 @@
 # Series acceleration (NR 5.3): epsilon algorithm and Levin u-transform.
-# Port of the C++ reference.
+#
 import sys
 
 SMALL = 2.2250738585072014e-307

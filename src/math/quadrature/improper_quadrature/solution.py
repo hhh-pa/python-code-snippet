@@ -1,4 +1,4 @@
-# Improper integrals (NR 4.4). Port of the C++ reference.
+# Improper integrals (NR 4.4).
 import math
 import sys
 

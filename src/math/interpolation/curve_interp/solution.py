@@ -1,4 +1,4 @@
-# Curve interpolation in multidimensions (NR 3.7.5). Port of the C++ reference.
+# Curve interpolation in multidimensions (NR 3.7.5).
 import math
 import sys
 

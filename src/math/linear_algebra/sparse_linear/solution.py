@@ -1,5 +1,5 @@
 # Sparse linear systems (NR 2.7): CCS matvecs + BiCG.
-# Port of the C++ reference.
+#
 import math
 import sys
 

@@ -1,4 +1,4 @@
-# Romberg integration (NR 4.3). Port of the C++ reference.
+# Romberg integration (NR 4.3).
 import math
 import sys
 

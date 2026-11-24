@@ -1,4 +1,4 @@
-# QR decomposition (NR 2.10, QRdcmp). Port of the C++ reference.
+# QR decomposition (NR 2.10, QRdcmp).
 import math
 import sys
 

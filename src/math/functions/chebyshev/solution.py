@@ -1,4 +1,4 @@
-# Chebyshev approximation (NR 5.8-5.11). Port of the C++ reference.
+# Chebyshev approximation (NR 5.8-5.11).
 import math
 import sys
 

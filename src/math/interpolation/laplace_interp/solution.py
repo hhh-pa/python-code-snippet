@@ -1,4 +1,4 @@
-# Laplace interpolation (NR 3.8). Port of the C++ reference.
+# Laplace interpolation (NR 3.8).
 import sys
 
 

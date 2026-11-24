@@ -1,5 +1,5 @@
 # Continued fraction evaluation (NR 5.2, modified Lentz's method).
-# Port of the C++ reference.
+#
 import sys
 
 

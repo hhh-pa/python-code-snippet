@@ -1,5 +1,5 @@
 # Singular value decomposition (NR 2.6 contract): one-sided Jacobi.
-# Port of the C++ reference.
+#
 import math
 import sys
 

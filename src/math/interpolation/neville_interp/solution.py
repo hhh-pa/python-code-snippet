@@ -1,4 +1,4 @@
-# Polynomial interpolation by Neville's algorithm (NR 3.2). Port of the C++ reference.
+# Polynomial interpolation by Neville's algorithm (NR 3.2).
 import sys
 
 

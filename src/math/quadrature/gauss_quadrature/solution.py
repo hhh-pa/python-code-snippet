@@ -1,4 +1,4 @@
-# Gaussian quadrature rules (NR 4.6). Port of the C++ reference.
+# Gaussian quadrature rules (NR 4.6).
 import math
 import sys
 

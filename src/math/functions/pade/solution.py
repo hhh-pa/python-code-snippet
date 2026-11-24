@@ -1,4 +1,4 @@
-# Pade approximants (NR 5.12). Port of the C++ reference.
+# Pade approximants (NR 5.12).
 import sys
 
 

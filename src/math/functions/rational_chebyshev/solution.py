@@ -1,4 +1,4 @@
-# Rational Chebyshev approximation (NR 5.13, ratlsq). Port of the C++ reference.
+# Rational Chebyshev approximation (NR 5.13, ratlsq).
 import math
 import sys
 

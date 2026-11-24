@@ -1,4 +1,4 @@
-# Hypergeometric 2F1 by path integration (NR 5.14). Port of the C++ reference.
+# Hypergeometric 2F1 by path integration (NR 5.14).
 import math
 import sys
 

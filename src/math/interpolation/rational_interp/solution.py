@@ -1,4 +1,4 @@
-# Rational interpolation (NR 3.4). Port of the C++ reference.
+# Rational interpolation (NR 3.4).
 import sys
 
 

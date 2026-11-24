@@ -1,4 +1,4 @@
-# Clenshaw's recurrence (NR 5.4). Port of the C++ reference.
+# Clenshaw's recurrence (NR 5.4).
 import sys
 
 

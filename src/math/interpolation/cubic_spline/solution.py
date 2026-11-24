@@ -1,4 +1,4 @@
-# Cubic spline interpolation (NR 3.3). Port of the C++ reference.
+# Cubic spline interpolation (NR 3.3).
 import sys
 
 

@@ -1,4 +1,4 @@
-# Multidimensional grid quadrature (NR 4.8). Port of the C++ reference.
+# Multidimensional grid quadrature (NR 4.8).
 import math
 import sys
 

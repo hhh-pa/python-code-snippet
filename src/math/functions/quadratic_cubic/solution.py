@@ -1,4 +1,4 @@
-# Quadratic and cubic equations (NR 5.6). Port of the C++ reference.
+# Quadratic and cubic equations (NR 5.6).
 import math
 import sys
 
